@@ -1,10 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Jun 12 12:05:36 2025
-
-@author: mauhl
-"""
-
 from __future__ import annotations
 
 """Delta‑v calibrator with robust fallbacks.
@@ -54,7 +47,6 @@ class CalibrationConfig:
     inner_loop_tol: float = 1e-5
     # --- grid‑search fallback -------------------------------------------------
     grid_search_points: int = 15
-    improvement_tol: float = 1e-8  # consider optimiser stalled if change < tol
     # --- bottom‑N seeding -----------------------------------------------------
     bottom_n: int = 0          # 0 disables feature
     similarity_metric: str = "abs_distance"
@@ -228,7 +220,6 @@ class DeltaVTopKCalibrator:
             raise ValueError("tau must be non‑negative.")
         if t_sim <= 0:
             raise ValueError("t_sim must be positive.")
-        # finiteness check
         for arr in [delta_u] + arrays + [A]:
             if not np.isfinite(arr).all():
                 raise ValueError("Input arrays contain non‑finite values.")
@@ -244,7 +235,6 @@ class DeltaVTopKCalibrator:
         gamma_u_vec = self.config.gamma_multiplier * self.delta_u
         gamma_v_vec = self.config.gamma_multiplier * delta_v_vec
 
-        # quantise vector to integer ticks of size delta_v_min → stable key
         key = (
             np.round(delta_v_vec / self.config.delta_v_min).astype(np.int32).tobytes()
         )
@@ -316,34 +306,42 @@ class DeltaVTopKCalibrator:
         if idx in self._locked_idx:
             return idx, base_dv[idx]
 
+        # first-pass solver
         res = minimize_scalar(
             lambda x: self._objective_single(idx, x, base_dv),
             bounds=(self.config.delta_v_min, self.config.delta_v_max),
             method="bounded",
         )
-
-        if res.success and res.fun < self._objective_single(idx, base_dv[idx], base_dv):
-            return idx, float(res.x)
-
-        # --- fallback path ------------------------------------------------
-        dv_grid, err_grid = self._grid_search(idx, base_dv)
-
-        # second attempt: narrow search around grid best
-        half_span = 0.25 * (self.config.delta_v_max - self.config.delta_v_min)
-        lo = max(self.config.delta_v_min, dv_grid - half_span)
-        hi = min(self.config.delta_v_max, dv_grid + half_span)
-        res2 = minimize_scalar(
-            lambda x: self._objective_single(idx, x, base_dv),
-            bounds=(lo, hi),
-            method="bounded",
-        )
-        if res2.success and res2.fun < err_grid - self.config.improvement_tol:
-            return idx, float(res2.x)
-
-        # lock occupation if still no improvement
-        warnings.warn(f"Locking occupation {idx} – optimiser stalled.")
-        self._locked_idx.add(idx)
-        return idx, dv_grid
+        old_dv = base_dv[idx]
+        new_dv = float(res.x)
+        # accept if solver converged and changed value meaningfully
+        if res.success and abs(new_dv - old_dv) > 1e-12:
+            return idx, new_dv
+        # test for no-change + vacancy error
+        no_change = abs(new_dv - old_dv) < 1e-12
+        U_fin, V_fin, E_fin = self._run_model(np.where(np.arange(len(base_dv))==idx, new_dv, base_dv), self.t_sim)
+        model_rate = (V_fin[-1][idx] / max(V_fin[-1][idx] + E_fin[-1][idx], self.config.eps_denom))
+        emp_rate = self.vac_emp[idx]
+        rel_error = abs(model_rate - emp_rate) / max(emp_rate, self.config.eps_denom)
+        if not res.success or (no_change and rel_error > 0.30):
+            # fallback stage 1: grid search
+            dv_grid, err_grid = self._grid_search(idx, base_dv)
+            # fallback stage 2: refined solver around grid best
+            half_span = 0.25 * (self.config.delta_v_max - self.config.delta_v_min)
+            lo = max(self.config.delta_v_min, dv_grid - half_span)
+            hi = min(self.config.delta_v_max, dv_grid + half_span)
+            res2 = minimize_scalar(
+                lambda x: self._objective_single(idx, x, base_dv),
+                bounds=(lo, hi),
+                method="bounded",
+            )
+            if res2.success and abs(res2.x - dv_grid) > 1e-12:
+                return idx, float(res2.x)
+            warnings.warn(f"Locking occupation {idx} – optimiser stalled.")
+            self._locked_idx.add(idx)
+            return idx, dv_grid
+        # otherwise accept new_dv
+        return idx, new_dv
 
     # ---------------------------------------------------------------------
     # bottom‑N seeding
@@ -354,19 +352,13 @@ class DeltaVTopKCalibrator:
         if N <= 0:
             return
 
-        # identify bottom‑N by employment, excluding any top‑K index
         non_top_idx = [i for i in range(len(self.E0)) if i not in self.top_idx]
         bottom_idx = sorted(non_top_idx, key=lambda x: self.E0[x])[:N]
 
-        if not bottom_idx:
-            return
-
         for b_idx in bottom_idx:
-            # find closest vacancy‑rate top‑K occupation
             distances = np.abs(self.vac_emp[self.top_idx] - self.vac_emp[b_idx])
             nearest_top = int(self.top_idx[int(np.argmin(distances))])
             self.delta_v[b_idx] = self.delta_v[nearest_top]
-            # note: we do not lock bottom occupations; they continue to optimise
 
     # ---------------------------------------------------------------------
     # public API
@@ -397,7 +389,6 @@ class DeltaVTopKCalibrator:
                 if max_delta < self.config.inner_loop_tol:
                     break
 
-            # evaluate RMSE on top‑K
             U_fin, V_fin, E_fin = self._run_model(self.delta_v, self.t_sim)
             vac_final = V_fin[-1] / np.maximum(V_fin[-1] + E_fin[-1], self.config.eps_denom)
             model_top = vac_final[self.top_idx]
@@ -410,7 +401,6 @@ class DeltaVTopKCalibrator:
                 print("  Early‑stop: RMSE improvement below tolerance.")
                 break
 
-        # optional bottom‑N seeding before final γ_v export
         self._seed_bottom_n()
 
         final_gamma_v = self.config.gamma_multiplier * self.delta_v
