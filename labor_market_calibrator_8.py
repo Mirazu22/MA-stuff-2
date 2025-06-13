@@ -492,3 +492,56 @@ class DeltaVTopKCalibrator:
     def reset_locks(self) -> None:
         """Unlock all previously locked occupations."""
         self._locked_idx.clear()
+
+
+
+
+
+"""
+# 1) First, tweak _grid_search to accept optional lo/hi bounds:
+
+def _grid_search(
+    self,
+    idx: int,
+    base_dv: NDArrayFloat,
+    lo: float | None = None,
+    hi: float | None = None,
+) -> Tuple[float, float]:
+    """Return (best_dv, best_err) on a uniform grid in [lo, hi]."""
+    lo = self.config.delta_v_min if lo is None else lo
+    hi = self.config.delta_v_max if hi is None else hi
+    pts = np.linspace(lo, hi, self.config.grid_search_points)
+    errs = [self._objective_single(idx, x, base_dv) for x in pts]
+    best_i = int(np.argmin(errs))
+    return float(pts[best_i]), float(errs[best_i])
+
+
+# 2) Then in _fit_one_occ, replace the fallback with:
+
+if (not res.success) or (tiny_move and rel_error > 0.30):
+    # pick search-direction based on whether model > target
+    if new_rate > emp_rate:
+        lo, hi = self.config.delta_v_min, base_dv[idx]
+    else:
+        lo, hi = base_dv[idx], self.config.delta_v_max
+
+    # directional grid search using the revised helper
+    dv_grid, _ = self._grid_search(idx, base_dv, lo=lo, hi=hi)
+
+    # local refine as before
+    span = 0.25 * (self.config.delta_v_max - self.config.delta_v_min)
+    lo_refine = max(self.config.delta_v_min, dv_grid - span)
+    hi_refine = min(self.config.delta_v_max, dv_grid + span)
+    res2 = minimize_scalar(
+        lambda x: self._objective_single(idx, x, base_dv),
+        bounds=(lo_refine, hi_refine),
+        method="bounded",
+    )
+    if res2.success and abs(res2.x - dv_grid) > 1e-12:
+        new_dv_raw = float(res2.x)
+    else:
+        warnings.warn(f"Locking occupation {idx} – optimiser stalled.")
+        self._locked_idx.add(idx)
+        new_dv_raw = dv_grid
+"""
+
