@@ -17,29 +17,18 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 def parent(code: str | int, digits: int = 3) -> str:
-    """Return the *prefix* of a KldB-4 code.
-
-    Works with both integer and string codes.
-
-    Examples
-    --------
-    >>> parent(1234, 3)
-    '123'
-    >>> parent('1234', 2)
-    '12'
-    """
+    """Return the *prefix* of a KldB‑4 code (works with int or str)."""
     if digits not in (2, 3):
         raise ValueError("digits must be 2 or 3 for KldB aggregation")
     code_str = str(code)
     if len(code_str) < digits:
         raise ValueError(
-            f"code '{code_str}' shorter than requested prefix length {digits}"
-        )
+            f"code '{code_str}' shorter than requested prefix length {digits}")
     return code_str[:digits]
 
 
 def _to_str_index(obj: pd.Series | pd.DataFrame):
-    """Return a *copy* with the index (and columns if DataFrame) coerced to str."""
+    """Return a *copy* with the index (and columns) coerced to *str*."""
     out = obj.copy()
     out.index = out.index.astype(str)
     if isinstance(out, pd.DataFrame):
@@ -51,24 +40,42 @@ def _to_str_index(obj: pd.Series | pd.DataFrame):
 # ---------------------------------------------------------------------------
 
 def build_map(empl: pd.Series, *, threshold: int) -> Dict[str, str]:
-    """Create a mapping from every 4‑digit code to its aggregated bucket.
+    """Map each 4‑digit code to its final bucket, **preserving** high‑employment codes.
 
-    Step 1 – collapse to 3‑digit parents.  Step 2 – if the 3‑digit bucket is
-    still below *threshold*, collapse further to 2‑digit.
+    Logic
+    -----
+    1. Keep any 4‑digit code whose employment ≥ *threshold* as its **own** bucket.
+    2. Collapse the remaining (low) codes to their 3‑digit parent.
+    3. For those 3‑digit buckets whose *combined* employment is still below
+       *threshold*, collapse **only those** further to 2‑digit.
     """
     empl_str = _to_str_index(empl)
 
-    codes = empl_str.index
-    map3 = codes.to_series().map(lambda c: parent(c, 3))
-    mapping: Dict[str, str] = dict(zip(codes, map3))
+    mapping: Dict[str, str] = {}
+    low_codes: list[str] = []
 
-    # Totals on the 3‑digit level
-    empl3 = empl_str.groupby(map3).sum()
+    # Step 1 – decide which 4‑digit codes survive
+    for code, emp in empl_str.items():
+        code_s = str(code)
+        if emp >= threshold:
+            mapping[code_s] = code_s  # keep as 4‑digit
+        else:
+            p3 = parent(code_s, 3)
+            mapping[code_s] = p3
+            low_codes.append(code_s)
 
-    low3 = empl3[empl3 < threshold].index
-    if not low3.empty:
-        for code in codes:
-            if mapping[code] in low3:
+    if not low_codes:
+        return mapping  # everyone met the threshold
+
+    # Step 2 – evaluate the 3‑digit buckets built from low codes only
+    low_series = empl_str[low_codes]
+    bucket3 = pd.Series({c: mapping[c] for c in low_codes})
+    tot3 = low_series.groupby(bucket3).sum()
+    underfilled3 = tot3[tot3 < threshold].index
+
+    if not underfilled3.empty:
+        for code in low_codes:
+            if mapping[code] in underfilled3:
                 mapping[code] = parent(code, 2)
 
     return mapping
@@ -78,32 +85,27 @@ def build_map(empl: pd.Series, *, threshold: int) -> Dict[str, str]:
 # ---------------------------------------------------------------------------
 
 def aggregate_employment(empl: pd.Series, mapping: Dict[str, str]) -> pd.Series:
-    """Aggregate an employment vector using *mapping* (handles int indices)."""
+    """Aggregate an employment vector using *mapping* (int or str indices)."""
     empl_str = _to_str_index(empl)
     grouped = empl_str.groupby(empl_str.index.map(mapping)).sum()
     return grouped.sort_index()
 
 
 def aggregate_matrix(trans: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
-    """Aggregate both rows and columns of a transition count matrix.
-
-    Accepts DataFrames whose indices/columns are int64 or str.
-    """
+    """Aggregate both rows and columns of a transition count matrix."""
     trans_str = _to_str_index(trans)
-
-    # Group rows then columns
     rows = trans_str.groupby(mapping, axis=0).sum()
     cols = rows.groupby(mapping, axis=1).sum()
-    keys = sorted(cols.index)
-    return cols.loc[keys, keys]
+    order = sorted(cols.index)
+    return cols.loc[order, order]
 
 # ---------------------------------------------------------------------------
 # 4. summarisation helper
 # ---------------------------------------------------------------------------
 
 def summarise_aggregation(mapping: Dict[str, str], empl: pd.Series) -> pd.DataFrame:
-    """DataFrame with one row per final bucket and aggregation details."""
-    empl_str = _to_str_index(empl)  # ensure index comparable to mapping keys
+    """DataFrame summarising the final buckets and their membership."""
+    empl_str = _to_str_index(empl)
     df = pd.DataFrame({
         "origin": list(mapping.keys()),
         "agg": [mapping[k] for k in mapping.keys()],
@@ -111,17 +113,14 @@ def summarise_aggregation(mapping: Dict[str, str], empl: pd.Series) -> pd.DataFr
     df["empl"] = df["origin"].map(empl_str)
     summary = (
         df.groupby("agg")
-        .agg(
-            members=("origin", list),
-            total_employment=("empl", "sum"),
-        )
-        .assign(num_codes=lambda d: d["members"].str.len())
-        .sort_index()
+          .agg(members=("origin", list), total_employment=("empl", "sum"))
+          .assign(num_codes=lambda d: d["members"].str.len())
+          .sort_index()
     )
     return summary
 
 # ---------------------------------------------------------------------------
-# 5. high‑level convenience wrapper
+# 5. high‑level wrapper
 # ---------------------------------------------------------------------------
 
 def aggregate_kldb(
@@ -131,7 +130,7 @@ def aggregate_kldb(
     threshold: int = 5_000,
     warn_if_unresolved: bool = True,
 ) -> Tuple[pd.DataFrame, pd.Series, Dict[str, str], pd.DataFrame]:
-    """Collapse KldB‑4 transition counts until employment ≥ *threshold*."""
+    """Aggregate transition counts/employment vector + rich summary."""
     mapping = build_map(empl, threshold=threshold)
     empl_new = aggregate_employment(empl, mapping)
     trans_new = aggregate_matrix(trans, mapping)
@@ -147,11 +146,11 @@ def aggregate_kldb(
     return trans_new, empl_new, mapping, summary
 
 # ---------------------------------------------------------------------------
-# 6. optional: convert counts to row‑stochastic probabilities
+# 6. utilities
 # ---------------------------------------------------------------------------
 
 def row_stochastic(counts: pd.DataFrame) -> pd.DataFrame:
-    """Normalise each row of *counts* so it sums to 1 (zero rows ignored)."""
+    """Row‑normalise a count matrix to probabilities (ignoring zero rows)."""
     totals = counts.sum(axis=1).replace(0, np.nan)
     return counts.div(totals, axis=0)
 
@@ -160,18 +159,17 @@ def row_stochastic(counts: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Toy data with *integer* indices to mimic the user's case
+    # Toy data with int indices; code 1234 >= threshold will SURVIVE as 4‑digit
     idx_int = [1234, 1235, 1241, 2111, 2112, 3110]
     np.random.seed(1)
-    toy_trans_int = pd.DataFrame(
+    toy_trans = pd.DataFrame(
         np.random.randint(0, 100, size=(len(idx_int), len(idx_int))),
         index=idx_int,
         columns=idx_int,
     )
-    toy_empl_int = pd.Series([200, 150, 50, 90, 40, 10], index=idx_int)
+    toy_empl = pd.Series([2500, 80, 60, 2100, 30, 15], index=idx_int)
 
-    T, E, M, S = aggregate_kldb(toy_trans_int, toy_empl_int, threshold=200)
-    print("Aggregated employment:\n", E)
-    print("\nAggregated transition matrix:\n", T)
-    print("\nMapping:\n", M)
+    T, E, M, S = aggregate_kldb(toy_trans, toy_empl, threshold=500)
+    print("Surviving 4‑digit codes:", [k for k, v in M.items() if k == v])
+    print("\nAggregated employment:\n", E)
     print("\nSummary:\n", S)
