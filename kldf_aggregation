@@ -1,0 +1,185 @@
+import pandas as pd
+import numpy as np
+from typing import Dict, Tuple
+
+__all__ = [
+    "parent",
+    "build_map",
+    "aggregate_employment",
+    "aggregate_matrix",
+    "aggregate_kldb",
+    "summarise_aggregation",
+    "row_stochastic",
+]
+
+# ---------------------------------------------------------------------------
+# 1. helpers
+# ---------------------------------------------------------------------------
+
+def parent(code: str, digits: int = 3) -> str:
+    """Return the *prefix* of a KldB-4 code.
+
+    Parameters
+    ----------
+    code : str
+        The 4-digit occupation code (e.g. "1234").
+    digits : {2, 3}
+        Length of the desired parent code.
+
+    Returns
+    -------
+    str
+        The leading *digits* characters.  Example:
+        ``parent('1234', 3) -> '123'``.
+    """
+    if digits not in (2, 3):
+        raise ValueError("digits must be 2 or 3 for KldB aggregation")
+    code_str = str(code)
+    if len(code_str) < digits:
+        raise ValueError(f"code '{code_str}' shorter than requested prefix length {digits}")
+    return code_str[:digits]
+
+# ---------------------------------------------------------------------------
+# 2. build the aggregation map
+# ---------------------------------------------------------------------------
+
+def build_map(empl: pd.Series, *, threshold: int) -> Dict[str, str]:
+    """Create a mapping from every 4-digit code to its aggregated bucket.
+
+    The rule is:
+    1. All 4-digit codes are first collapsed to their 3-digit parent.
+    2. Any 3-digit bucket whose total employment is still below *threshold*
+       is further collapsed to its 2-digit parent.
+
+    Returns
+    -------
+    dict
+        ``{"1234": "123", "1256": "12", ...}``  (values length 2 or 3).
+    """
+    empl = empl.copy()
+    empl.index = empl.index.astype(str)
+
+    # Step 1: initial 3-digit mapping
+    codes = empl.index
+    map3 = codes.to_series().map(lambda c: parent(c, 3))
+    mapping = dict(zip(codes, map3))
+
+    # Employment totals for the 3-digit level
+    empl3 = empl.groupby(map3).sum()
+
+    # Step 2: identify undersized 3-digit groups -> collapse to 2-digit
+    low3 = empl3[empl3 < threshold].index
+    if not low3.empty:
+        for code in codes:
+            if mapping[code] in low3:
+                mapping[code] = parent(code, 2)
+
+    return mapping
+
+# ---------------------------------------------------------------------------
+# 3. aggregation helpers
+# ---------------------------------------------------------------------------
+
+def aggregate_employment(empl: pd.Series, mapping: Dict[str, str]) -> pd.Series:
+    """Aggregate an employment vector using *mapping*."""
+    grouped = empl.groupby(empl.index.map(mapping)).sum()
+    return grouped.sort_index()
+
+
+def aggregate_matrix(trans: pd.DataFrame, mapping: Dict[str, str]) -> pd.DataFrame:
+    """Aggregate both rows and columns of a transition count matrix."""
+    grp_rows = trans.groupby(mapping, axis=0).sum()
+    grp_cols = grp_rows.groupby(mapping, axis=1).sum()
+    keys = sorted(grp_cols.index)
+    return grp_cols.loc[keys, keys]
+
+# ---------------------------------------------------------------------------
+# 4. summarisation helper
+# ---------------------------------------------------------------------------
+
+def summarise_aggregation(mapping: Dict[str, str], empl: pd.Series) -> pd.DataFrame:
+    """Return a summary of what codes were aggregated into each final bucket.
+
+    Output columns:
+      - members: list of original 4-digit codes
+      - total_employment: sum of employment in each bucket
+      - num_codes: number of codes aggregated
+    """
+    df = pd.DataFrame({
+        'origin': list(mapping.keys()),
+        'agg': [mapping[k] for k in mapping.keys()],
+    })
+    df['empl'] = df['origin'].map(empl)
+    summary = (
+        df.groupby('agg')
+          .agg(members=('origin', list), total_employment=('empl', 'sum'))
+          .assign(num_codes=lambda d: d['members'].str.len())
+          .sort_index()
+    )
+    return summary
+
+# ---------------------------------------------------------------------------
+# 5. high-level convenience wrapper
+# ---------------------------------------------------------------------------
+
+def aggregate_kldb(
+    trans: pd.DataFrame,
+    empl: pd.Series,
+    *,
+    threshold: int = 5000,
+    warn_if_unresolved: bool = True,
+) -> Tuple[pd.DataFrame, pd.Series, Dict[str, str], pd.DataFrame]:
+    """Collapse KldB-4 transition counts until employment ≥ *threshold*.
+
+    Returns
+    -------
+    tuple
+        (trans_agg, empl_agg, mapping, summary) where
+        * trans_agg – aggregated transition counts
+        * empl_agg  – aggregated employment vector
+        * mapping   – dict documenting every 4→final bucket mapping
+        * summary   – DataFrame summarising each final bucket
+    """
+    mapping = build_map(empl, threshold=threshold)
+    empl_new = aggregate_employment(empl, mapping)
+    trans_new = aggregate_matrix(trans, mapping)
+    summary = summarise_aggregation(mapping, empl)
+
+    if warn_if_unresolved and (empl_new < threshold).any():
+        import warnings
+        warnings.warn(
+            "Some buckets remain below the threshold even after 2-digit aggregation.",
+            RuntimeWarning,
+        )
+
+    return trans_new, empl_new, mapping, summary
+
+# ---------------------------------------------------------------------------
+# 6. optional: convert counts to row-stochastic probabilities
+# ---------------------------------------------------------------------------
+
+def row_stochastic(counts: pd.DataFrame) -> pd.DataFrame:
+    """Normalise each row of counts to sum to 1 (ignores zero rows)."""
+    totals = counts.sum(axis=1).replace(0, np.nan)
+    return counts.div(totals, axis=0)
+
+# ---------------------------------------------------------------------------
+# 7. minimal self-test
+# ---------------------------------------------------------------------------
+
+if __name__ == "__main__":
+    # Toy data
+    idx = ["1234", "1235", "1241", "2111", "2112", "3110"]
+    np.random.seed(0)
+    toy_trans = pd.DataFrame(
+        np.random.randint(0, 100, size=(len(idx), len(idx))),
+        index=idx,
+        columns=idx,
+    )
+    toy_empl = pd.Series([200, 150, 50, 90, 40, 10], index=idx)
+
+    T, E, M, S = aggregate_kldb(toy_trans, toy_empl, threshold=200)
+    print("Aggregated employment:\n", E)
+    print("\nAggregated transition matrix:\n", T)
+    print("\nMapping:\n", M)
+    print("\nSummary:\n", S)
