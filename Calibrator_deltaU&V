@@ -1,0 +1,525 @@
+# -*- coding: utf-8 -*-
+"""
+Delta‑u/Delta‑v calibrator for the labornet ABM (June 2025)
+==========================================================
+Calibrates *both* spontaneous separation probabilities (δ_u) and
+spontaneous vacancy–opening probabilities (δ_v) so that—at the chosen
+pre‑shock horizon `t_sim`—each of the **top‑K** occupations simultaneously
+matches its empirical unemployment **and** vacancy rate.
+
+The algorithm is a **coordinate‑wise 2‑D search**:
+    ▸ For every sweep and for every occupation *i* among the top‑K
+      (ranked by employment), optimise the 2‑parameter sub‑problem
+      (δ_u_i, δ_v_i) while all other parameters are held constant.
+    ▸ The sub‑problem is solved with Powell's bounded derivative‑free
+      minimiser in SciPy.
+    ▸ A single damping step (α ≈ 0.2) is applied to both δ's after each
+      successful occupation‑level update.
+    ▸ Occupations outside the top‑K copy the calibrated pair from their
+      nearest neighbour in (u,v) space once the sweeps converge.
+
+Notes
+-----
+*   κ_u and κ_v are kept **fixed** ("directed" intensities).  They are set
+    via `gamma_multiplier` in the configuration below:  γ_u = κ · δ_u, and
+    γ_v = κ · δ_v.
+*   The global objective is a weighted MSE that blends unemployment and
+    vacancy errors:
+        Loss = Σ_i w_i [ λ (u_mod−u_emp)^2 + (1−λ) (v_mod−v_emp)^2 ]
+    where w_i ∝ employment_i^β  (β≈0.5 by default).
+*   An LRU cache keyed on the *pair* (δ_u, δ_v) accelerates the many
+    repeated model evaluations.
+
+Public API
+~~~~~~~~~~
+    >>> calib = DeltaUVTopKCalibrator(
+    ...     delta_u_init, delta_v_init,
+    ...     unemployment_emp, vacancy_emp,
+    ...     E0, U0, V0, D0,
+    ...     t_sim, A, tau,
+    ...     top_k=100,
+    ... )
+    >>> delta_u_star, delta_v_star, rmse_log = calib.fit()
+
+The returned arrays can be passed directly to the numerical‑shock or
+Beveridge‑curve runners.
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import warnings
+from collections import OrderedDict
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import numpy.typing as npt
+from scipy.optimize import minimize
+
+import labornet as lbn
+
+NDArrayFloat = npt.NDArray[np.floating]
+
+# -----------------------------------------------------------------------------
+# CONFIGURATION
+# -----------------------------------------------------------------------------
+
+@dataclasses.dataclass(frozen=True)
+class CalibrationConfig:
+    """Hyper‑parameters controlling the 2‑D delta‑u/delta‑v calibration."""
+
+    # --- bounds --------------------------------------------------------------
+    delta_u_min: float = 1e-4
+    delta_u_max: float = 5.0e-2
+    delta_v_min: float = 1e-6
+    delta_v_max: float = 1.0e-1
+
+    # --- γ multipliers (κ) ---------------------------------------------------
+    gamma_multiplier: float = 10.0  # κ_u = κ_v  (kept fixed)
+
+    # --- optimisation --------------------------------------------------------
+    damping_alpha: float = 0.2  # applied once per occupation update
+    inner_loop_max: int = 3
+    inner_loop_tol: float = 1e-5
+
+    # --- objective weights ---------------------------------------------------
+    lambda_unemp: float = 0.5  # weight on unemployment term (λ)
+    beta_emp_weight: float = 0.5  # exponent β in w_i ∝ emp^β
+
+    # --- cache ---------------------------------------------------------------
+    cache_max_size: int = 2000
+    cache_max_memory_mb: float = 200.0
+
+    # --- numerical epsilons --------------------------------------------------
+    eps_denom: float = 1e-12
+    t_shock_large: int = 9999  # ensures "pre‑shock" stationary run
+
+DEFAULT_CONFIG = CalibrationConfig()
+
+# -----------------------------------------------------------------------------
+# LRU CACHE (identical to the delta‑v‑only calibrator but now stores (δu,δv))
+# -----------------------------------------------------------------------------
+
+class LRUCache:
+    """Byte‑bounded LRU cache specialised for numpy arrays."""
+
+    def __init__(self, maxsize: int, max_memory_mb: float) -> None:
+        self.maxsize = maxsize
+        self.max_memory_bytes = int(max_memory_mb * 1024 * 1024)
+        self.cache: OrderedDict[bytes, Tuple[NDArrayFloat, NDArrayFloat, NDArrayFloat]] = (
+            OrderedDict()
+        )
+        self.current_memory = 0
+
+    @staticmethod
+    def _array_size(arrays: Tuple[NDArrayFloat, NDArrayFloat, NDArrayFloat]) -> int:
+        return sum(a.nbytes for a in arrays)
+
+    def get(self, key: bytes) -> Optional[Tuple[NDArrayFloat, NDArrayFloat, NDArrayFloat]]:
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            return self.cache[key]
+        return None
+
+    def put(self, key: bytes, value: Tuple[NDArrayFloat, NDArrayFloat, NDArrayFloat]) -> None:
+        item_size = self._array_size(value)
+        if item_size > self.max_memory_bytes:
+            warnings.warn(
+                f"Item of size {item_size / 1024 ** 2:.2f} MB exceeds cache limit; skipping."
+            )
+            return
+        if key in self.cache:
+            self.current_memory -= self._array_size(self.cache[key])
+            del self.cache[key]
+        while (
+            self.cache
+            and (
+                len(self.cache) >= self.maxsize
+                or self.current_memory + item_size > self.max_memory_bytes
+            )
+        ):
+            _, old_val = self.cache.popitem(last=False)
+            self.current_memory -= self._array_size(old_val)
+        self.cache[key] = value
+        self.current_memory += item_size
+
+# -----------------------------------------------------------------------------
+# MAIN CALIBRATOR
+# -----------------------------------------------------------------------------
+
+class DeltaUVTopKCalibrator:
+    """Coordinate‑wise 2‑D calibrator for (δ_u, δ_v).
+
+    Parameters
+    ----------
+    delta_u_init, delta_v_init : array‑like, shape (N_occ,)
+        Initial guesses for δ_u and δ_v.  Values are clipped to their
+        respective bounds at instantiation.
+    unemployment_emp, vacancy_emp : array‑like, shape (N_occ,)
+        Empirical steady‑state unemployment and vacancy rates for each
+        occupation.
+    E0, U0, V0, D0 : array‑like
+        Baseline employment, unemployment, vacancies, and demand.
+    t_sim : int
+        Number of time steps to run *per* model evaluation.
+    A : ndarray, shape (N_occ, N_occ)
+        Mobility network (row‑stochastic).
+    tau : int
+        Tenure memory parameter of the ABM.
+    top_k : int, default 100
+        Number of largest occupations (by employment) to calibrate
+        explicitly.  The remainder copy from their nearest neighbour after
+        convergence.
+    max_sweeps : int, default 5
+        Maximum outer sweeps.
+    tol_rmse : float, default 1e‑4
+        Convergence threshold on global RMSE between sweeps.
+    config : CalibrationConfig, optional
+        Override defaults.
+    """
+
+    def __init__(
+        self,
+        delta_u_init: NDArrayFloat,
+        delta_v_init: NDArrayFloat,
+        unemployment_emp: NDArrayFloat,
+        vacancy_emp: NDArrayFloat,
+        E0: NDArrayFloat,
+        U0: NDArrayFloat,
+        V0: NDArrayFloat,
+        D0: NDArrayFloat,
+        t_sim: int,
+        A: NDArrayFloat,
+        tau: int,
+        *,
+        top_k: int = 100,
+        n_workers: Optional[int] = None,  # placeholder for future parallel
+        max_sweeps: int = 5,
+        tol_rmse: float = 1e-4,
+        config: Optional[CalibrationConfig] = None,
+    ) -> None:
+        self.config = config or DEFAULT_CONFIG
+        self._validate_inputs(
+            delta_u_init,
+            delta_v_init,
+            unemployment_emp,
+            vacancy_emp,
+            E0,
+            U0,
+            V0,
+            D0,
+            A,
+            tau,
+            top_k,
+            max_sweeps,
+            t_sim,
+        )
+        # --- state ----------------------------------------------------------------
+        self.delta_u = np.clip(
+            np.asarray(delta_u_init, float),
+            self.config.delta_u_min,
+            self.config.delta_u_max,
+        )
+        self.delta_v = np.clip(
+            np.asarray(delta_v_init, float),
+            self.config.delta_v_min,
+            self.config.delta_v_max,
+        )
+        self.u_emp = np.asarray(unemployment_emp, float).copy()
+        self.v_emp = np.asarray(vacancy_emp, float).copy()
+        self.E0 = np.asarray(E0, float).copy()
+        self.U0 = np.asarray(U0, float).copy()
+        self.V0 = np.asarray(V0, float).copy()
+        self.D0 = np.asarray(D0, float).copy()
+        self.A = np.asarray(A, float).copy()
+        self.tau = int(tau)
+        self.t_sim = int(t_sim)
+        # --- employment‑share weighting --------------------------------------------
+        emp_share = self.E0 / self.E0.sum()
+        beta = self.config.beta_emp_weight
+        self.weights_all = (emp_share ** beta) / (emp_share ** beta).sum()
+        # top‑K subset
+        self.sorted_idx = np.argsort(-self.E0)
+        self.top_idx = self.sorted_idx[:top_k]
+        self.top_weights = self.weights_all[self.top_idx]
+        # map idx -> w for fast lookup
+        self.idx_to_weight: Dict[int, float] = dict(zip(range(len(self.E0)), self.weights_all))
+        # --- misc
+        self.max_sweeps = max_sweeps
+        self.tol_rmse = tol_rmse
+        self.n_workers = 1  # serial for now; placeholder for future parallel pool
+        # --- cache ------------------------------------------------------------------
+        self._cache = LRUCache(self.config.cache_max_size, self.config.cache_max_memory_mb)
+
+    # ---------------------------------------------------------------------
+    # INPUT VALIDATION
+    # ---------------------------------------------------------------------
+
+    @staticmethod
+    def _validate_inputs(
+        delta_u_init,
+        delta_v_init,
+        unemployment_emp,
+        vacancy_emp,
+        E0,
+        U0,
+        V0,
+        D0,
+        A,
+        tau,
+        top_k,
+        max_sweeps,
+        t_sim,
+    ) -> None:
+        n_occ = len(delta_u_init)
+        if A.shape != (n_occ, n_occ):
+            raise ValueError("A matrix shape does not match number of occupations.")
+        arrays_same_length = [
+            delta_v_init,
+            unemployment_emp,
+            vacancy_emp,
+            E0,
+            U0,
+            V0,
+            D0,
+        ]
+        if not all(len(a) == n_occ for a in arrays_same_length):
+            raise ValueError("All input arrays must have the same length.")
+        if not (1 <= top_k <= n_occ):
+            raise ValueError("top_k must be between 1 and number of occupations.")
+        if max_sweeps < 1:
+            raise ValueError("max_sweeps must be >= 1.")
+        if tau < 0:
+            raise ValueError("tau must be non‑negative.")
+        if t_sim <= 0:
+            raise ValueError("t_sim must be positive.")
+        for arr in [delta_u_init, delta_v_init] + arrays_same_length + [A]:
+            if not np.isfinite(arr).all():
+                raise ValueError("Input arrays contain non‑finite values.")
+
+    # ---------------------------------------------------------------------
+    # CORE MODEL WRAPPER WITH CACHING
+    # ---------------------------------------------------------------------
+
+    def _run_model(
+        self,
+        delta_u_vec: NDArrayFloat,
+        delta_v_vec: NDArrayFloat,
+        t_steps: int,
+    ) -> Tuple[NDArrayFloat, NDArrayFloat, NDArrayFloat]:
+        """Runs labornet for *t_steps* and returns (U,V,E).  Cached."""
+        gamma_u_vec = np.clip(self.config.gamma_multiplier * delta_u_vec, 0.03, 1.0)
+        gamma_v_vec = np.clip(self.config.gamma_multiplier * delta_v_vec, 0.03, 1.0)
+        # discretise both δ_u & δ_v for a stable cache key (int64 for safety)
+        du_ticks = np.round((delta_u_vec - self.config.delta_u_min) / 1e-6).astype(np.int64)
+        dv_ticks = np.round((delta_v_vec - self.config.delta_v_min) / 1e-6).astype(np.int64)
+        key = du_ticks.tobytes() + dv_ticks.tobytes()
+        cached = self._cache.get(key)
+        if cached is not None:
+            return cached
+        U, V, E, _, _ = lbn.run_numerical_solution(
+            lbn.fire_and_hire_workers,
+            t_steps,
+            delta_u_vec,
+            delta_v_vec,
+            gamma_u_vec,
+            gamma_v_vec,
+            self.E0,
+            self.U0,
+            self.V0,
+            target_demand_function=lambda t, *args: self.D0,
+            D_0=self.D0,
+            D_f=self.D0,
+            t_shock=self.config.t_shock_large,
+            k=0,
+            t_halfsig=0,
+            matching=lbn.matching_probability,
+            A_matrix=self.A,
+            τ=self.tau,
+        )
+        result = (U, V, E)
+        self._cache.put(key, result)
+        return result
+
+    # ---------------------------------------------------------------------
+    # OBJECTIVE FOR A SINGLE OCCUPATION (embedding global feedback)
+    # ---------------------------------------------------------------------
+
+    def _objective_single(
+        self,
+        idx: int,
+        du_dv: NDArrayFloat,
+        base_du: NDArrayFloat,
+        base_dv: NDArrayFloat,
+    ) -> float:
+        """2‑D loss for occupation *idx* (δ_u, δ_v) → scalar."""
+        du_trial = float(
+            np.clip(du_dv[0], self.config.delta_u_min, self.config.delta_u_max)
+        )
+        dv_trial = float(
+            np.clip(du_dv[1], self.config.delta_v_min, self.config.delta_v_max)
+        )
+        du_vec = base_du.copy(); du_vec[idx] = du_trial
+        dv_vec = base_dv.copy(); dv_vec[idx] = dv_trial
+        # Forward model
+        U_fin, V_fin, E_fin = self._run_model(du_vec, dv_vec, self.t_sim)
+        # rates
+        u_mod = U_fin[-1] / np.maximum(U_fin[-1] + E_fin[-1], self.config.eps_denom)
+        v_mod = V_fin[-1] / np.maximum(V_fin[-1] + E_fin[-1], self.config.eps_denom)
+        # errors (switch to absolute when target tiny)
+        u_target = self.u_emp[idx]
+        v_target = self.v_emp[idx]
+        u_err = u_mod[idx] - u_target
+        v_err = v_mod[idx] - v_target
+        lam = self.config.lambda_unemp
+        w = self.idx_to_weight[idx]
+        return float(w * (lam * u_err * u_err + (1.0 - lam) * v_err * v_err))
+
+    # ---------------------------------------------------------------------
+    # FIT ONE OCCUPATION (Powell 2‑D search)
+    # ---------------------------------------------------------------------
+
+    def _fit_one_occ(
+        self,
+        idx: int,
+        base_du: NDArrayFloat,
+        base_dv: NDArrayFloat,
+    ) -> Tuple[int, float, float]:
+        """Optimise (δ_u, δ_v) for occupation *idx*."""
+        x0 = np.array([base_du[idx], base_dv[idx]])
+        bounds = [
+            (self.config.delta_u_min, self.config.delta_u_max),
+            (self.config.delta_v_min, self.config.delta_v_max),
+        ]
+        res = minimize(
+            lambda x: self._objective_single(idx, x, base_du, base_dv),
+            x0,
+            method="Powell",
+            bounds=bounds,
+            options={"xtol": 1e-4, "ftol": 1e-6, "maxiter": 50},
+        )
+        du_new, dv_new = res.x
+        du_new = float(np.clip(du_new, self.config.delta_u_min, self.config.delta_u_max))
+        dv_new = float(np.clip(dv_new, self.config.delta_v_min, self.config.delta_v_max))
+        return idx, du_new, dv_new
+
+    # ---------------------------------------------------------------------
+    # OPTIONAL: NEAREST‑NEIGHBOUR SEEDING FOR TAIL OCCUPATIONS
+    # ---------------------------------------------------------------------
+
+    def _seed_tail(self) -> None:
+        """Copy calibrated parameters to occupations outside the top‑K."""
+        non_top_idx = [i for i in range(len(self.E0)) if i not in self.top_idx]
+        for j in non_top_idx:
+            # nearest neighbour in (u,v) empirical space
+            dist = np.hypot(self.u_emp[self.top_idx] - self.u_emp[j],
+                            self.v_emp[self.top_idx] - self.v_emp[j])
+            nn = int(self.top_idx[int(np.argmin(dist))])
+            self.delta_u[j] = self.delta_u[nn]
+            self.delta_v[j] = self.delta_v[nn]
+
+    # ---------------------------------------------------------------------
+    # MAIN FIT LOOP
+    # ---------------------------------------------------------------------
+
+    def fit(self) -> Tuple[NDArrayFloat, NDArrayFloat, List[float]]:
+        """Run the coordinate‑wise 2‑D calibration.
+
+        Returns
+        -------
+        delta_u_star, delta_v_star : ndarrays
+            Calibrated parameter vectors.
+        rmse_log : list of float
+            Global objective ‑> RMSE trajectory across sweeps.
+        """
+        rmse_log: List[float] = []
+        lam = self.config.lambda_unemp
+        for sweep in range(self.max_sweeps):
+            print(f"\n=== Sweep {sweep + 1}/{self.max_sweeps} ===")
+            for _ in range(self.config.inner_loop_max):
+                max_delta = 0.0
+                base_du = self.delta_u.copy()
+                base_dv = self.delta_v.copy()
+                for idx in self.top_idx:
+                    _, du_new, dv_new = self._fit_one_occ(idx, base_du, base_dv)
+                    du_old, dv_old = self.delta_u[idx], self.delta_v[idx]
+                    # damping
+                    du_up = (1.0 - self.config.damping_alpha) * du_old + self.config.damping_alpha * du_new
+                    dv_up = (1.0 - self.config.damping_alpha) * dv_old + self.config.damping_alpha * dv_new
+                    self.delta_u[idx] = du_up
+                    self.delta_v[idx] = dv_up
+                    max_delta = max(max_delta, abs(du_up - du_old), abs(dv_up - dv_old))
+                print(f"  max |Δδ| = {max_delta:.2e}")
+                if max_delta < self.config.inner_loop_tol:
+                    break
+            # ---- compute global RMSE ------------------------------------------------
+            U_fin, V_fin, E_fin = self._run_model(self.delta_u, self.delta_v, self.t_sim)
+            u_mod = U_fin[-1] / np.maximum(U_fin[-1] + E_fin[-1], self.config.eps_denom)
+            v_mod = V_fin[-1] / np.maximum(V_fin[-1] + E_fin[-1], self.config.eps_denom)
+            diff_u = u_mod[self.top_idx] - self.u_emp[self.top_idx]
+            diff_v = v_mod[self.top_idx] - self.v_emp[self.top_idx]
+            mse = float(np.sum(self.top_weights * (lam * diff_u**2 + (1.0 - lam) * diff_v**2)))
+            rmse = float(np.sqrt(mse))
+            rmse_log.append(rmse)
+            print(f"  RMSE = {rmse:.6e}")
+            if sweep > 0 and abs(rmse_log[-2] - rmse) < self.tol_rmse:
+                print("  Early‑stop: RMSE improvement below tolerance.")
+                break
+        # ------- propagate calibrated params to tail occupations --------------------
+        self._seed_tail()
+        return self.delta_u.copy(), self.delta_v.copy(), rmse_log
+
+    # ---------------------------------------------------------------------
+    # BASIC REPORTING (optional convenience)
+    # ---------------------------------------------------------------------
+
+    def report_calibration(self) -> None:
+        """Print a human–readable per‑occupation summary (top‑K)."""
+        U_fin, V_fin, E_fin = self._run_model(self.delta_u, self.delta_v, self.t_sim)
+        u_mod = U_fin[-1] / np.maximum(U_fin[-1] + E_fin[-1], self.config.eps_denom)
+        v_mod = V_fin[-1] / np.maximum(V_fin[-1] + E_fin[-1], self.config.eps_denom)
+        print("\n=== Calibration report (top‑K) ===")
+        for idx in self.top_idx:
+            print(
+                f"occ {idx:>3d}: δ_u {self.delta_u[idx]:.6f}, δ_v {self.delta_v[idx]:.6f}; "
+                f"u_mod {u_mod[idx]:.5f} vs u_emp {self.u_emp[idx]:.5f}; "
+                f"v_mod {v_mod[idx]:.5f} vs v_emp {self.v_emp[idx]:.5f}"
+            )
+config = CalibrationConfig(
+    delta_u_min=1e-4,
+    delta_u_max=5e-2,
+    delta_v_min=1e-6,
+    delta_v_max=1e-1,
+    gamma_multiplier=10.0,
+    bottom_n=0,           # disable tail seeding for now
+    damping_alpha=0.2,
+    inner_loop_max=3,
+    inner_loop_tol=1e-5,
+    cache_max_size=1000,
+    cache_max_memory_mb=100.0
+)
+
+calibrator = DeltaUVCalibrator(
+    delta_u=delta_u_init,
+    delta_v_init=delta_v_init,
+    unemployment_emp=unemp_emp,
+    vacancy_emp=vac_emp,
+    E0=E0,
+    U0=U0,
+    V0=V0,
+    D0=D0,
+    A=A_matrix,
+    tau=tau,
+    t_sim=t_sim,
+    top_k=100,
+    max_sweeps=5,
+    tol_rmse=1e-4,
+    config=config
+)
+
+# run the coordinate-wise 2D calibration
+delta_u_opt, delta_v_opt, rmse_history = calibrator.fit()
+
+# (optional) inspect results
+for i, (du, dv) in enumerate(zip(delta_u_opt, delta_v_opt)):
+    print(f"Occ {i:03d}: δu = {du:.6f}, δv = {dv:.6f}")
