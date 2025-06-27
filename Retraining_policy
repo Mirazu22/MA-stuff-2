@@ -1,70 +1,98 @@
-# candidate_retraining_edges.py
+# step1_assess_highly_affected_runtime.py
+# --------------------------------------
+# Usage (pseudo-code):
+#
+#   import labornet as lbn
+#   from step1_assess_highly_affected_runtime import assess_highly_affected
+#
+#   # --- set / load your calibrated inputs here ----------------------------
+#   t_simulation   = 600
+#   t_shock        = 100
+#   τ              = 3
+#   δ_u, δ_v       = 0.016, 0.012
+#   γ_u, γ_v       = 10*δ_u, 10*δ_u
+#   k, sigmoid_hl  = lbn.calibrate_sigmoid(30*52/6.75)   # as in paper
+#   employment_0   = ...   # vector length 464
+#   unemployment_0 = δ_u * employment_0
+#   vacancies_0    = δ_v * employment_0
+#   D_0            = employment_0 + unemployment_0
+#   D_f            = lbn.labor_restructure(D_0, p)       # p = automation probs
+#   A_omn_hetero   = np.genfromtxt("data/occupational_mobility_network_heteroloops.csv",
+#                                  delimiter=',')
+#   # -----------------------------------------------------------------------
+#
+#   df = assess_highly_affected(t_simulation, t_shock, A_omn_hetero, τ,
+#                               δ_u, δ_v, γ_u, γ_v,
+#                               employment_0, unemployment_0, vacancies_0,
+#                               D_0, D_f, k, sigmoid_hl)
+#   print(df.head(20))          # or df.to_csv("highly_affected.csv", index=False)
+
 import numpy as np
 import pandas as pd
 from pathlib import Path
-from scipy.sparse.csgraph import shortest_path
+import labornet as lbn
 
-def candidate_retraining_edges(V, E, A, t_shock, source_id,
-                               top_k=10,
-                               names_path="data/ipums_variables.csv"):
+
+def assess_highly_affected(t_simulation, t_shock, A_omn_hetero, τ,
+                           δ_u, δ_v, γ_u, γ_v,
+                           employment_0, unemployment_0, vacancies_0,
+                           D_0, D_f, k, sigmoid_half_life):
     """
-    Identify target occupations whose vacancy-rate spikes most during the
-    automation shock and are close (but not already connected) to `source_id`.
+    Run the heterogenous-loop OMN once and return a DataFrame with:
 
-    Parameters
-    ----------
-    V, E : np.ndarray
-        Vacancy and employment matrices (rows = timesteps, cols = occupations);
-        this orientation matches the arrays saved in `RunNumericalShock.py` :contentReference[oaicite:0]{index=0}.
-    A : np.ndarray
-        Row-stochastic occupational-mobility adjacency matrix.
-    t_shock : int
-        Index where the shock starts.
-    source_id : int
-        Index of the high-unemployment occupation you want to help.
-    top_k : int
-        How many candidate targets to return.
-    names_path : str
-        CSV with columns `label` (names) and `auto_prob_average`.
-
-    Returns
-    -------
-    pandas.DataFrame
-        Columns: [target_id, name, dist, ΔV_peak, V_baseline, automation_prob]
+        occupation | name | ΔU_peak | U_baseline | employment_pre | automation_prob | severity_score
     """
-    # ---------- 1. vacancy-rate spike ------------------------------------ #
-    V_rate   = V / (V + E)
-    V_base   = V_rate[t_shock - 1, :]                 # baseline vacancy rate
-    ΔV_peak  = (V_rate[t_shock:, :] - V_base).max(axis=0)
+    # ------------------------------------------------------------------ #
+    # 1. Run the numerical solution (rows = timesteps, columns = occs). #
+    # ------------------------------------------------------------------ #
+    U, V, E, U_all, D = lbn.run_numerical_solution(
+        lbn.fire_and_hire_workers, t_simulation,
+        δ_u, δ_v, γ_u, γ_v,
+        employment_0, unemployment_0, vacancies_0,
+        lbn.target_demand_automation, D_0, D_f,
+        t_shock, k, sigmoid_half_life,
+        lbn.matching_probability, A_omn_hetero, τ
+    )
 
-    # ---------- 2. weighted shortest paths from source ------------------- #
-    # cost = −log(weight); unreachable edges → ∞
-    cost_mat = np.where(A > 0, -np.log(A), np.inf)
-    dists    = shortest_path(cost_mat, directed=True, indices=source_id)
+    # -------------------------------------------------------------- #
+    # 2. Baseline & spike in unemployment rate (per occupation).    #
+    # -------------------------------------------------------------- #
+    U_rate      = U / (U + E)                 # unemployment-rate matrix
+    U_baseline  = U_rate[t_shock - 1, :]      # vector length n_occ
+    ΔU_peak     = (U_rate[t_shock:, :] - U_baseline).max(axis=0)
 
-    # ---------- 3. mask: drop self & existing neighbours ----------------- #
-    is_neighbour = A[source_id, :] > 0
-    mask = (~is_neighbour) & np.isfinite(dists) & (np.arange(A.shape[0]) != source_id)
+    # employment right before the shock
+    employment_pre = E[t_shock - 1, :]
 
-    # ---------- 4. human-readable labels --------------------------------- #
-    df_labs  = pd.read_csv(Path(names_path))
-    names    = df_labs["label"].values
-    auto_prob= df_labs["auto_prob_average"].values
+    # -------------------------------------------------------------- #
+    # 3. Static occupation attributes (names, automation prob).      #
+    # -------------------------------------------------------------- #
+    df_labs   = pd.read_csv(Path("data") / "ipums_variables.csv")
+    names     = df_labs["label"].values                       # names/index match model order:contentReference[oaicite:0]{index=0}
+    auto_prob = df_labs["auto_prob_average"].values
 
-    # ---------- 5. assemble & sort --------------------------------------- #
-    df = (pd.DataFrame({
-            "target_id"      : np.arange(A.shape[0])[mask],
-            "name"           : names[mask],
-            "dist"           : dists[mask],
-            "ΔV_peak"        : ΔV_peak[mask],
-            "V_baseline"     : V_base[mask],
-            "automation_prob": auto_prob[mask]
-          })
-          .sort_values(["dist", "ΔV_peak"], ascending=[True, False])
-          .head(top_k)
-          .reset_index(drop=True))
+    # -------------------------------------------------------------- #
+    # 4. Composite severity score (same formula we agreed on).       #
+    # -------------------------------------------------------------- #
+    severity = (ΔU_peak / np.maximum(U_baseline, 1e-9)) * employment_pre * auto_prob
 
-    return df
+    # -------------------------------------------------------------- #
+    # 5. Bundle everything into a tidy DataFrame.                    #
+    # -------------------------------------------------------------- #
+    df_out = (pd.DataFrame({
+                "occupation"      : np.arange(A_omn_hetero.shape[0]),
+                "name"            : names,
+                "ΔU_peak"         : ΔU_peak,
+                "U_baseline"      : U_baseline,
+                "employment_pre"  : employment_pre,
+                "automation_prob" : auto_prob,
+                "severity_score"  : severity
+              })
+              .sort_values("severity_score", ascending=False)
+              .reset_index(drop=True))
+
+    return df_out
+
 
 # candidate_retraining_edges_nx.py
 import numpy as np
