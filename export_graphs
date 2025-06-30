@@ -1,0 +1,88 @@
+import seaborn as sns
+import matplotlib.pyplot as plt
+from cycler import cycler
+
+def set_econ_paper_style(font_scale=1):
+    """
+    Activate an Economist-style, journal-ready Seaborn/Matplotlib theme
+    that does NOT require LaTeX on the host machine.
+    """
+    econ_palette = [
+        "#006BA2",  # econ blue
+        "#E3120B",  # econ red
+        "#379A8B",  # teal/green
+        "#EBB434",  # gold
+        "#9A607F",  # purple
+        "#758D99"   # grey
+    ]
+    rc = {
+        # --- typography ---
+        "font.family": "serif",
+        "font.serif": ["Times New Roman", "DejaVu Serif"],
+        "font.size": 7 * font_scale,
+        "axes.titlesize": 8 * font_scale,
+        "axes.labelsize": 7 * font_scale,
+        "axes.titleweight": "bold",
+        # --- layout & spines ---
+        "axes.edgecolor": "black",
+        "axes.linewidth": .8,
+        "axes.axisbelow": True,
+        "axes.grid": True,
+        "grid.color": ".8",
+        "grid.linestyle": "--",
+        "grid.linewidth": .5,
+        # --- ticks ---
+        "xtick.direction": "out",
+        "ytick.direction": "out",
+        "xtick.major.size": 3,
+        "ytick.major.size": 3,
+        "xtick.major.width": .8,
+        "ytick.major.width": .8,
+        # --- lines & markers ---
+        "lines.linewidth": 1,
+        "lines.markersize": 4,
+        # --- legend ---
+        "legend.fontsize": 6 * font_scale,
+        "legend.frameon": False,
+        # --- figure & saving ---
+        "figure.figsize": (3.25, 2.0),  # one-column default
+        "savefig.dpi": 300,
+        # --- colour cycle ---
+        "axes.prop_cycle": cycler("color", econ_palette)
+    }
+    sns.set_theme(context="paper",
+                  style="ticks",
+                  palette=econ_palette,
+                  font="serif",
+                  font_scale=font_scale,
+                  rc=rc)
+
+    import matplotlib.pyplot as plt
+from matplotlib import rcParams
+
+# 1. Embed TrueType fonts in the PDF
+rcParams['pdf.fonttype'] = 42          # Type 42 = TrueType embedding :contentReference[oaicite:4]{index=4}
+
+# (Optional) Enable tight layout engine
+plt.rcParams['figure.constrained_layout.use'] = True  # alternative to tight_layout() :contentReference[oaicite:5]{index=5}
+
+# 2. Plot as usual…
+fig, ax = plt.subplots(figsize=(6, 4))
+
+# 3. Save with PDF-optimized settings:
+fig.savefig(
+    'figure.pdf',
+    format='pdf',                     # enforce PDF backend :contentReference[oaicite:6]{index=6}
+    dpi=300,                          # typically 300 DPI; 600 DPI for embedded rasters :contentReference[oaicite:7]{index=7}
+    bbox_inches='tight',              # crop all extra white space :contentReference[oaicite:8]{index=8}
+    pad_inches=0.0,                   # no padding around the figure :contentReference[oaicite:9]{index=9}
+    facecolor='white',                # background color (use 'none' for transparency) :contentReference[oaicite:10]{index=10}
+    edgecolor='none',                 # remove edge line :contentReference[oaicite:11]{index=11}
+    transparent=False,                # False: white background; True: transparent background :contentReference[oaicite:12]{index=12}
+    metadata={                        # embed metadata into the PDF
+        'Title': 'My Figure',
+        'Author': 'Me',
+        'Subject': 'Results',
+    }
+)
+
