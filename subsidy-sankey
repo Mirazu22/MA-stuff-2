@@ -9,72 +9,44 @@ def green_worker_origin_sankey(green_idx, labels,
                                top_k=10, t_window=None,
                                figsize=(10, 6)):
     """
-    Visualises where the *additional* hires into subsidised ‘green’ occupations
-    come from and prints the main donor-occupation metrics.
-
-    Parameters
-    ----------
-    green_idx : list[int]
-        Indices of the subsidised (destination) occupations.
-    labels : list[str]
-        len = n_occ.  Human-readable occupation names.
-    F_base, F_pol : ndarray (T, n, n)
-        Flow matrices from baseline and policy runs.   F[t,i,j] = hires j←i.
-    E_base, E_pol, U_base, U_pol : ndarray (T, n)
-        Employment & unemployment time-series (needed for donor stats).
-    top_k : int
-        Show this many largest donor occupations.
-    t_window : tuple(int,int) | None
-        Aggregate flows over [start, end) if given; otherwise use full horizon.
-    figsize : tuple
-        Matplotlib figure size.
-
-    Returns
-    -------
-    fig : Figure
-    donor_table : list[dict]   # one dict per donor with computed deltas
+    Sankey diagram + console stats for 'Where do the extra green hires come from?'
+    Uses Matplotlib.Sankey.  • Grey ribbons = baseline flow
+                              • Green ribbons = extra flow due to subsidy
     """
 
-    # -------- 1. Restrict to time window & aggregate -------------------------
-    if t_window is None:
-        slice_t = slice(None)              # all steps
-    else:
-        slice_t = slice(*t_window)
+    # ---------- 1. Aggregate flows over chosen time window ------------------
+    sl = slice(*t_window) if t_window is not None else slice(None)
+    base_in  = F_base[sl,:,green_idx].sum(axis=(0,2))
+    pol_in   = F_pol[sl,:,green_idx].sum(axis=(0,2))
+    extra_in = np.maximum(pol_in - base_in, 0.0)          # clip negatives
 
-    base_in  = F_base[slice_t,:,green_idx].sum(axis=(0,2))   # origin-wise
-    pol_in   = F_pol[slice_t,:,green_idx].sum(axis=(0,2))
-    extra_in = pol_in - base_in                               # Δ hires
-
-    # Guard: ignore negative or zero extras
-    extra_in[extra_in < 0] = 0.0
-
-    # -------- 2. Pick top-K donor occupations -------------------------------
+    # ---------- 2. Pick top-k donor occupations -----------------------------
     donors = extra_in.argsort()[::-1][:top_k]
-    donors = donors[extra_in[donors] > 0]                     # drop zeros
+    donors = donors[extra_in[donors] > 0]
     if donors.size == 0:
         raise ValueError("No positive extra inflow detected – subsidy too small?")
 
-    # -------- 3. Prepare Sankey flow vectors --------------------------------
     baseline_flows = base_in[donors]
     extra_flows    = extra_in[donors]
+    total_inflow   = baseline_flows.sum() + extra_flows.sum()
 
-    # colours: grey = baseline, green = extra
-    colours = []
-    for b, e in zip(baseline_flows, extra_flows):
-        colours.extend(["#888888", "#2ca02c"])   # two ribbons per donor
+    # ---------- 3. Build Sankey data ----------------------------------------
+    # Flows: -baseline, -extra (one pair per donor), +total_inflow (sink)
+    flows = np.hstack([-baseline_flows,
+                       -extra_flows,
+                       [total_inflow]])
 
-    flows = np.hstack([ -baseline_flows,          # out of donor
-                        -extra_flows,             # out of donor (extra)
-                        baseline_flows + extra_flows ])  # balancing inflow
+    # Orientations: send donors’ outflows to the right (1), sink inflow left (-1)
+    orientations = [1]*(2*len(donors)) + [-1]
+
+    # Colours: grey for baseline, green for extra, default for sink
+    colours = ["#888888"]*len(donors) + ["#2ca02c"]*len(donors) + ["#b0e0b0"]
 
     labels_flows = [f"{labels[d]} (base)" for d in donors] + \
                    [f"{labels[d]} (Δ)"   for d in donors] + \
                    ["Green jobs (total)"]
 
-    # Orientations: send everything to the right except the balancing inflow
-    orientations = [1]* (2*len(donors)) + [-1]
-
-    # -------- 4. Build the Sankey diagram -----------------------------------
+    # ---------- 4. Plot Sankey ----------------------------------------------
     fig = plt.figure(figsize=figsize)
     ax  = fig.add_subplot(1,1,1)
     sankey = Sankey(ax=ax, unit='', gap=0.5)
@@ -85,16 +57,13 @@ def green_worker_origin_sankey(green_idx, labels,
     sankey.finish()
     ax.set_title("Where do additional green-job hires come from?")
 
-    # -------- 5. Print donor stats ------------------------------------------
-    donor_table = []
+    # ---------- 5. Console stats  -------------------------------------------
     print("\nTop-{} donor occupations:".format(len(donors)))
     print("{:<35s} {:>11s} {:>11s} {:>11s}".format(
           "Occupation", "base→green", "Δ hires", "Δ emp"))
+    donor_table = []
     for d, b, e in zip(donors, baseline_flows, extra_flows):
-        # employment delta (end-of-sim)
         emp_delta = E_pol[-1,d] - E_base[-1,d]
-
-        # unemployment-rate delta (mean over sim)
         ur_base = U_base[:,d] / (U_base[:,d] + E_base[:,d])
         ur_pol  = U_pol[:,d]  / (U_pol[:,d]  + E_pol[:,d])
         ur_delta = ur_pol.mean() - ur_base.mean()
