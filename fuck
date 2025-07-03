@@ -1,0 +1,25 @@
+from reportlab.graphics import renderPDF
+from reportlab.pdfgen.canvas import Canvas
+from reportlab.lib.pagesizes import A4       # (595 pt × 842 pt)
+from svglib.svglib import svg2rlg
+
+PAGE      = A4
+MARGIN    = 20            # free border in points
+
+drawing   = svg2rlg("some.svg")
+
+# scale so the drawing fits inside the printable rectangle
+sx = sy = min((PAGE[0]-2*MARGIN)/drawing.width,
+              (PAGE[1]-2*MARGIN)/drawing.height)
+
+drawing.scale(sx, sy)     # geometric transform
+drawing.width  *= sx       # *also* fix the recorded size –
+drawing.height *= sy       #   ReportLab uses these later
+
+# centre on the page
+x = (PAGE[0] - drawing.width)  / 2
+y = (PAGE[1] - drawing.height) / 2
+
+pdf = Canvas("some.pdf", pagesize=PAGE)
+renderPDF.draw(drawing, pdf, x, y)
+pdf.save()
