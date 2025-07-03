@@ -1,22 +1,56 @@
-from reportlab.graphics import renderPDF
-from reportlab.pdfgen.canvas import Canvas
-from reportlab.lib.pagesizes import A4       # (595 pt × 842 pt)
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Place an SVG network graph on an oversize page without fattening the lines.
+"""
+
 from svglib.svglib import svg2rlg
+from reportlab.pdfgen.canvas import Canvas
+from reportlab.graphics import renderPDF
+from reportlab.lib.units import mm                 # convenient real-world units
+from reportlab.graphics.shapes import Group        # for type checks
 
-PAGE      = A4
-MARGIN    = 20            # free border in points
+# ---------------------------------------------------------------------------
+# 1. pick the page you want (A2 portrait here –- 420 mm × 594 mm)
+#    any tuple (width, height) in points is OK as long as each side
+#    is between 3 pt and 14 400 pt (≈ 0.04 in – 200 in)
+# ---------------------------------------------------------------------------
+PAGE   = (420 * mm, 594 * mm)
+MARGIN = 20                                        # free border, points
 
-drawing   = svg2rlg("some.svg")
+# ---------------------------------------------------------------------------
+# 2. load the SVG as a ReportLab Drawing
+# ---------------------------------------------------------------------------
+drawing = svg2rlg("some.svg")
 
-# scale so the drawing fits inside the printable rectangle
-sx = sy = min((PAGE[0]-2*MARGIN)/drawing.width,
-              (PAGE[1]-2*MARGIN)/drawing.height)
+# ---------------------------------------------------------------------------
+# 3. work out how much we *need* to enlarge it to fit inside the page
+# ---------------------------------------------------------------------------
+sx = sy = min((PAGE[0] - 2*MARGIN) / drawing.width,
+              (PAGE[1] - 2*MARGIN) / drawing.height)
 
-drawing.scale(sx, sy)     # geometric transform
-drawing.width  *= sx       # *also* fix the recorded size –
-drawing.height *= sy       #   ReportLab uses these later
+# ---------------------------------------------------------------------------
+# 4. scale geometry but keep stroke widths unchanged
+# ---------------------------------------------------------------------------
+if sx > 1.0:                                       # we are making it bigger
+    def _fix_strokes(node, factor):
+        """Walk the scene-graph; divide every strokeWidth by *factor*."""
+        if hasattr(node, "strokeWidth") and node.strokeWidth not in (None, 0):
+            node.strokeWidth /= factor
+        # recurse into groups or drawings
+        if isinstance(node, Group) or hasattr(node, "contents"):
+            for child in getattr(node, "contents", []):
+                _fix_strokes(child, factor)
 
-# centre on the page
+    _fix_strokes(drawing, sx)                      # thin the lines first
+    drawing.scale(sx, sy)                          # then enlarge the geometry
+    drawing.width  *= sx
+    drawing.height *= sy
+    # (if sx ≤ 1.0 we’re shrinking: no need to touch the strokes)
+
+# ---------------------------------------------------------------------------
+# 5. centre the drawing and write the PDF
+# ---------------------------------------------------------------------------
 x = (PAGE[0] - drawing.width)  / 2
 y = (PAGE[1] - drawing.height) / 2
 
