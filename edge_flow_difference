@@ -1,60 +1,69 @@
-# edge_flow_accounting.py
+# edge_flow_accounting_multi.py
 import numpy as np
 import pandas as pd
 
-def edge_flow_difference(F_time_base, F_time_new,
-                          source_id, target_ids, cumulative=True):
+def edge_flow_difference_multi(F_time_base,
+                                F_time_new,
+                                source_to_targets,
+                                cumulative=True):
     """
-    Compare the aggregate worker flows along the injected links
-    (source_id ➜ target_ids) between a *baseline* run and a *treated*
-    run that includes the retraining edges.
+    Compute, for every source occupation in `source_to_targets`,
+    how many *extra* workers flow along the specified edges after
+    the policy is introduced, compared with the baseline run.
 
     Parameters
     ----------
     F_time_base : list[np.ndarray]
-        Sequence of flow matrices one per timestep from the baseline run;
-        each matrix F has shape (n_occ, n_occ) and F[i,j] is the expected
-        number of workers moving i ➜ j in that step (as returned by
-        `fire_and_hire_workers`) :contentReference[oaicite:0]{index=0}.
+        Per-timestep flow matrices from the *baseline* simulation.
     F_time_new  : list[np.ndarray]
-        Same, but for the run **with** injected edges.
-    source_id   : int
-        Hard-hit occupation whose unemployed workers you are redirecting.
-    target_ids  : Sequence[int]
-        List/array of occupation indices that received the new links.
-    cumulative  : bool, default True
-        Adds a running sum column if True.
+        Per-timestep flow matrices from the *treated* simulation
+        that includes the injected edges.
+    source_to_targets : dict[int, Sequence[int]]
+        Keys   = source occupation IDs (hard-hit jobs).
+        Values = list / array of target occupation IDs to which
+                 the new or strengthened links point.
+    cumulative : bool, default True
+        Adds a running-sum column for each source if True.
 
     Returns
     -------
     pandas.DataFrame
         Columns:
-            t               – timestep index
-            baseline_flow   – total workers baseline source➜targets
-            new_flow        – total workers treated  source➜targets
-            delta_flow      – new_flow − baseline_flow
-            cum_delta_flow  – cumulative sum of delta_flow (if cumulative)
+            source_id
+            t                 timestep
+            baseline_flow     Σ_j F_base[source, j]   over chosen j
+            new_flow          Σ_j F_new [source, j]
+            delta_flow        new_flow − baseline_flow
+            cum_delta_flow    cumulative δ (if cumulative=True)
     """
     if len(F_time_base) != len(F_time_new):
         raise ValueError("Runs have different lengths.")
 
-    target_ids = np.asarray(target_ids)
-    n_steps    = len(F_time_base)
+    n_steps = len(F_time_base)
+    records = []
 
-    base_series = np.array([F[source_id, target_ids].sum()
-                            for F in F_time_base])
-    new_series  = np.array([F[source_id, target_ids].sum()
-                            for F in F_time_new])
-    delta       = new_series - base_series
+    for source_id, target_ids in source_to_targets.items():
+        target_ids = np.asarray(target_ids)
 
-    df = pd.DataFrame({
-        "t"            : np.arange(n_steps),
-        "baseline_flow": base_series,
-        "new_flow"     : new_series,
-        "delta_flow"   : delta
-    })
+        # per-step flows along the specified outgoing edges
+        base_series = np.array([F[source_id, target_ids].sum()
+                                for F in F_time_base])
+        new_series  = np.array([F[source_id, target_ids].sum()
+                                for F in F_time_new])
+        delta = new_series - base_series
+        cum   = delta.cumsum() if cumulative else None
 
-    if cumulative:
-        df["cum_delta_flow"] = df["delta_flow"].cumsum()
+        for t in range(n_steps):
+            rec = {
+                "source_id"     : source_id,
+                "t"             : t,
+                "baseline_flow" : base_series[t],
+                "new_flow"      : new_series[t],
+                "delta_flow"    : delta[t]
+            }
+            if cumulative:
+                rec["cum_delta_flow"] = cum[t]
+            records.append(rec)
 
+    df = pd.DataFrame(records)
     return df
