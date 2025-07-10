@@ -1,69 +1,75 @@
-# edge_flow_accounting_multi.py
+# retraining_destination_breakdown.py
 import numpy as np
 import pandas as pd
+from pathlib import Path
 
-def edge_flow_difference_multi(F_time_base,
-                                F_time_new,
-                                source_to_targets,
-                                cumulative=True):
+def retraining_destination_breakdown(F_time_base,
+                                     F_time_new,
+                                     source_id,
+                                     t_start,
+                                     names_path="data/ipums_variables.csv",
+                                     only_positive=True,
+                                     top_n=None):
     """
-    Compute, for every source occupation in `source_to_targets`,
-    how many *extra* workers flow along the specified edges after
-    the policy is introduced, compared with the baseline run.
+    For a single `source_id`, compute where the retrained workers go.
 
     Parameters
     ----------
-    F_time_base : list[np.ndarray]
-        Per-timestep flow matrices from the *baseline* simulation.
-    F_time_new  : list[np.ndarray]
-        Per-timestep flow matrices from the *treated* simulation
-        that includes the injected edges.
-    source_to_targets : dict[int, Sequence[int]]
-        Keys   = source occupation IDs (hard-hit jobs).
-        Values = list / array of target occupation IDs to which
-                 the new or strengthened links point.
-    cumulative : bool, default True
-        Adds a running-sum column for each source if True.
+    F_time_base, F_time_new : list[np.ndarray]
+        Per-timestep flow matrices from baseline and treated runs.
+        Each F[t] has shape (n_occ, n_occ) with F[i,j] = workers i→j.
+    source_id : int
+        Occupation whose outgoing retraining flows you want to study.
+    t_start : int
+        First timestep **included** in the sum (e.g. `t_shock`).
+    names_path : str
+        CSV containing at least the column “label” with occupation names.
+    only_positive : bool, default True
+        If True, keep only destinations with Δflow > 0.
+    top_n : int or None
+        Return only the largest `top_n` Δflows.  None → all.
 
     Returns
     -------
-    pandas.DataFrame
-        Columns:
-            source_id
-            t                 timestep
-            baseline_flow     Σ_j F_base[source, j]   over chosen j
-            new_flow          Σ_j F_new [source, j]
-            delta_flow        new_flow − baseline_flow
-            cum_delta_flow    cumulative δ (if cumulative=True)
+    pandas.DataFrame  sorted by `delta_flow` (descending)
+
+        target_id | name | baseline_flow | new_flow | delta_flow | share_of_delta
     """
     if len(F_time_base) != len(F_time_new):
         raise ValueError("Runs have different lengths.")
 
-    n_steps = len(F_time_base)
-    records = []
+    # stack the flow matrices from t_start onward
+    base_stack = np.stack(F_time_base[t_start:], axis=0)  # shape: (T, n, n)
+    new_stack  = np.stack(F_time_new [t_start:], axis=0)
 
-    for source_id, target_ids in source_to_targets.items():
-        target_ids = np.asarray(target_ids)
+    # total flows source -> every j over the window
+    base_tot = base_stack[:, source_id, :].sum(axis=0)
+    new_tot  = new_stack [:, source_id, :].sum(axis=0)
+    delta    = new_tot - base_tot
 
-        # per-step flows along the specified outgoing edges
-        base_series = np.array([F[source_id, target_ids].sum()
-                                for F in F_time_base])
-        new_series  = np.array([F[source_id, target_ids].sum()
-                                for F in F_time_new])
-        delta = new_series - base_series
-        cum   = delta.cumsum() if cumulative else None
+    # labels & meta
+    df_lab   = pd.read_csv(Path(names_path))
+    names    = df_lab["label"].values                   :contentReference[oaicite:0]{index=0}
 
-        for t in range(n_steps):
-            rec = {
-                "source_id"     : source_id,
-                "t"             : t,
-                "baseline_flow" : base_series[t],
-                "new_flow"      : new_series[t],
-                "delta_flow"    : delta[t]
-            }
-            if cumulative:
-                rec["cum_delta_flow"] = cum[t]
-            records.append(rec)
+    # build table
+    df = pd.DataFrame({
+        "target_id"     : np.arange(len(delta)),
+        "name"          : names,
+        "baseline_flow" : base_tot,
+        "new_flow"      : new_tot,
+        "delta_flow"    : delta
+    })
 
-    df = pd.DataFrame(records)
+    if only_positive:
+        df = df[df["delta_flow"] > 0]
+
+    # normalise share among *positive* deltas
+    total_delta = df["delta_flow"].sum()
+    df["share_of_delta"] = df["delta_flow"] / total_delta
+
+    df = df.sort_values("delta_flow", ascending=False)
+
+    if top_n is not None:
+        df = df.head(top_n).reset_index(drop=True)
+
     return df
