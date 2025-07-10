@@ -7,29 +7,27 @@ def green_worker_origin_sankey_plotly(green_idx, labels,
                                       U_base, U_pol,
                                       top_k=10, t_window=None):
     """
-    Sankey + donor stats   —   *cross-occupation inflow only*
-      • removes all self-loops (i == j)
-      • ignores origins that are subsidised themselves
+    Interactive Sankey showing cross-occupation inflow into subsidised jobs.
+
+    * Self-loops are removed.
+    * Donor occupations that are subsidised themselves are skipped.
+    * Each donor → sink ribbon contains two stacked stripes:
+          • grey   = hires that already happened in baseline
+          • green  = hires created by the subsidy
     """
 
-    # ------------------------------------------------------------------ #
-    # 0.  Drop self-loops *once*, right after your simulator returns F
-    # ------------------------------------------------------------------ #
+    # 0. ---------------------------------------------------  drop self-loops
     diag = np.arange(F_base.shape[1])
     F_base = F_base.copy();  F_base[:, diag, diag] = 0.0
     F_pol  = F_pol.copy();   F_pol[:,  diag, diag] = 0.0
 
-    # ------------------------------------------------------------------ #
-    # 1.  Aggregate flows over time window
-    # ------------------------------------------------------------------ #
+    # 1. ---------------------------------------------------  aggregate flows
     sl = slice(*t_window) if t_window else slice(None)
-    base_in  = F_base[sl, :, green_idx].sum(axis=(0, 2))
+    base_in  = F_base[sl, :, green_idx].sum(axis=(0, 2))   # origin-wise
     pol_in   = F_pol[sl, :, green_idx].sum(axis=(0, 2))
-    extra_in = np.maximum(pol_in - base_in, 0.0)          # clip negatives
+    extra_in = np.maximum(pol_in - base_in, 0.0)
 
-    # ------------------------------------------------------------------ #
-    # 2.  Keep only donors NOT in green_idx and with positive extra flow
-    # ------------------------------------------------------------------ #
+    # 2. ---------------------------------------------------  pick donors
     is_green = np.zeros(extra_in.size, dtype=bool)
     is_green[green_idx] = True
     donor_mask = (~is_green) & (extra_in > 0)
@@ -42,50 +40,60 @@ def green_worker_origin_sankey_plotly(green_idx, labels,
     base_flows  = base_in[donors]
     extra_flows = extra_in[donors]
 
-    # ------------------------------------------------------------------ #
-    # 3.  Build node & link lists for Plotly Sankey
-    # ------------------------------------------------------------------ #
-    node_labels, node_colors, donor_id_map = [], [], {}
-    for idx, d in enumerate(donors):
-        donor_id_map[d] = idx * 2
-        node_labels += [f"{labels[d]} (base)",
-                        f"{labels[d]} (Δ)"]
-        node_colors += ["#888888", "#2ca02c"]          # grey / green
+    # 3. ---------------------------------------------------  nodes
+    node_labels = [labels[d] for d in donors] + ["Green jobs (total)"]
+    node_colors = ["#dddddd"]*len(donors) + ["#b0e0b0"]   # pale sink
 
-    sink_id = len(node_labels)
-    node_labels.append("Green jobs (total)")
-    node_colors.append("#b0e0b0")                     # pale green
+    sink_id = len(donors)              # index of the sink node
 
-    sources, targets, values, colors = [], [], [], []
-    for d, b, e in zip(donors, base_flows, extra_flows):
-        src_base  = donor_id_map[d]
-        src_extra = src_base + 1
-        sources += [src_base,  src_extra]
-        targets += [sink_id,   sink_id]
-        values  += [b,         e]
-        colors  += ["#888888", "#2ca02c"]
+    # 4. ---------------------------------------------------  links (2 per donor)
+    sources = []
+    targets = []
+    values  = []
+    colors  = []
+    hovers  = []
 
-    fig = go.Figure(go.Sankey(
-        node=dict(label=node_labels, pad=15, thickness=15, color=node_colors),
-        link=dict(source=sources, target=targets, value=values,
-                  color=colors,
-                  hovertemplate="%{value:,.0f}<extra></extra>")
-    ))
+    for src_id, (b, e) in enumerate(zip(base_flows, extra_flows)):
+        # baseline stripe
+        sources.append(src_id)
+        targets.append(sink_id)
+        values.append(b)
+        colors.append("#888888")
+        hovers.append(f"Baseline hires: {b:,.0f}")
+
+        # subsidy-induced stripe
+        sources.append(src_id)
+        targets.append(sink_id)
+        values.append(e)
+        colors.append("#2ca02c")
+        hovers.append(f"Extra hires: {e:,.0f}")
+
+    link = dict(source=sources,
+                target=targets,
+                value=values,
+                color=colors,
+                hovertemplate="%{customdata}<extra></extra>",
+                customdata=hovers)
+
+    node = dict(label=node_labels,
+                color=node_colors,
+                pad=15,
+                thickness=15)
+
+    fig = go.Figure(go.Sankey(node=node, link=link))
     fig.update_layout(title="Cross-occupation inflow into subsidised green jobs",
-                      font=dict(size=12))
+                      font_size=12)
 
-    # ------------------------------------------------------------------ #
-    # 4.  Console stats for donors
-    # ------------------------------------------------------------------ #
+    # 5. ---------------------------------------------------  console stats
     print(f"\nTop-{len(donors)} cross-occupation donors")
     print("{:<35s} {:>11s} {:>11s} {:>11s}".format(
           "Occupation", "base→green", "Δ hires", "Δ emp"))
     donor_table = []
     for d, b, e in zip(donors, base_flows, extra_flows):
         emp_delta = E_pol[-1, d] - E_base[-1, d]
-        ur_base   = U_base[:, d] / (U_base[:, d] + E_base[:, d])
-        ur_pol    = U_pol[:, d]  / (U_pol[:, d]  + E_pol[:, d])
-        ur_delta  = ur_pol.mean() - ur_base.mean()
+        ur_base = U_base[:, d] / (U_base[:, d] + E_base[:, d])
+        ur_pol  = U_pol[:, d]  / (U_pol[:, d]  + E_pol[:, d])
+        ur_delta = ur_pol.mean() - ur_base.mean()
 
         print("{:<35s} {:>11.0f} {:>11.0f} {:>11.0f}  (Δ u-rate = {:+.2%})"
               .format(labels[d], b, e, emp_delta, ur_delta))
