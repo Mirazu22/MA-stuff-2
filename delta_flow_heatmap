@@ -1,6 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import matplotlib.transforms as mtransforms
 
 def delta_flow_heatmap(F_base, F_treat,
                        E_base=None,
@@ -61,10 +62,27 @@ def delta_flow_heatmap(F_base, F_treat,
     # ---- 5. mark subsidised occupations -----------------------------------
     if green_idx is not None:
         for g in green_idx:
-            ax.add_patch(patches.Rectangle((g-0.5, -0.5), 1, n,
-                                           fill=False, edgecolor='black', lw=1.5))
-            ax.add_patch(patches.Rectangle((-0.5, g-0.5), n, 1,
-                                           fill=False, edgecolor='black', lw=1.5))
+
+
+        pad_pts = 10                         # how far the triangles sit outside (points)
+        
+        # ▼  triangles below the x-axis  (destinations)
+        trans_x = mtransforms.offset_copy(
+                     ax.get_xaxis_transform(which='grid'),   # x = data, y = axes
+                     fig=ax.figure, y=-pad_pts, units='points')
+        ax.scatter(green_idx, np.zeros_like(green_idx),      # y=0 at the axis line
+                   marker='v', s=marker_size,
+                   facecolors='none', edgecolors='black', linewidths=1.2,
+                   transform=trans_x, clip_on=False)
+        
+        # ▸  triangles left of the y-axis  (origins)
+        trans_y = mtransforms.offset_copy(
+                     ax.get_yaxis_transform(which='grid'),   # y = data, x = axes
+                     fig=ax.figure, x=-pad_pts, units='points')
+        ax.scatter(np.zeros_like(green_idx), green_idx,      # x=0 at the axis line
+                   marker='>', s=marker_size,
+                   facecolors='none', edgecolors='black', linewidths=1.2,
+                   transform=trans_y, clip_on=False)
 
     plt.tight_layout()
     return fig, delta
