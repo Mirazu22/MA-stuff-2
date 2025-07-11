@@ -6,61 +6,65 @@ def delta_flow_heatmap(F_base, F_treat,
                        E_base=None,
                        green_idx=None,
                        t_window=None,
-                       norm='origin',          # 'origin', 'none', or callable
+                       norm='origin',          # 'origin', 'flow', 'none', callable
                        title=None,
-                       threshold=0,            # |Δ| below this → 0
+                       threshold=0,            # after scaling: |Δ|<thr → 0
                        figsize=(10, 8),
-                       cmap='coolwarm'):
+                       cmap='coolwarm',
+                       eps=1e-9):              # protects against divide-by-0
     """
-    Heat-map of Δ-flows (treatment − baseline) with subsidised targets marked.
-
-    green_idx : list[int] | None
-        Indices of subsidised occupations to highlight.
+    Heat-map of hiring-flow changes with optional scaling.
+    norm='flow'  → percentage change: (sum_treat - sum_base)/sum_base
     """
 
-    # -------- 1. aggregate ΔF over chosen window ---------------------------
+    # ---- 1. choose window & aggregate absolute flows ----------------------
     sli = slice(*t_window) if t_window else slice(None)
-    delta = (F_treat[sli] - F_base[sli]).sum(axis=0)   # shape (n,n)
+    sum_base  = F_base[sli].sum(axis=0)         # shape (n,n)
+    sum_treat = F_treat[sli].sum(axis=0)
+    delta_abs = sum_treat - sum_base
 
-    # -------- 2. optional scaling -----------------------------------------
-    if callable(norm):
-        delta = norm(delta, E_base)
+    # ---- 2. scaling -------------------------------------------------------
+    if callable(norm):                          # custom function
+        delta = norm(delta_abs, F_base, F_treat, E_base)
     elif norm == 'origin':
         if E_base is None:
             raise ValueError("E_base required for norm='origin'")
         emp = E_base[sli].mean(axis=0)
         emp[emp == 0] = 1
-        delta = delta / emp[:, None]
-    elif norm != 'none':
-        raise ValueError("norm must be 'origin', 'none', or callable")
+        delta = delta_abs / emp[:, None]
+    elif norm == 'flow':
+        denom = sum_base.copy()
+        denom[np.abs(denom) < eps] = np.nan      # avoid 0÷0 or tiny numbers
+        delta = delta_abs / denom               # percentage change
+    elif norm == 'none':
+        delta = delta_abs
+    else:
+        raise ValueError("norm must be 'origin', 'flow', 'none', or callable")
 
-    # -------- 3. threshold tiny values ------------------------------------
+    # ---- 3. threshold tiny values & choose colour scale -------------------
     delta[np.abs(delta) < threshold] = 0
+    vmax = np.nanpercentile(np.abs(delta), 99) or 1
 
-    # -------- 4. plot ------------------------------------------------------
+    # ---- 4. plot ----------------------------------------------------------
     n = delta.shape[0]
-    v = np.nanpercentile(np.abs(delta), 99) or 1
     fig, ax = plt.subplots(figsize=figsize)
-    im = ax.imshow(delta, cmap=cmap, vmin=-v, vmax=v)
+    im = ax.imshow(delta, cmap=cmap, vmin=-vmax, vmax=vmax)
 
-    ax.set_title(title or "Change in hiring flows (treatment − baseline)")
+    ax.set_title(title or "Δ hiring-flow (% change)" if norm=='flow'
+                 else "Δ hiring-flow (scaled)")
     ax.set_xticks(range(n)); ax.set_yticks(range(n))
-    ax.set_xticklabels([]);  ax.set_yticklabels([])       # hide labels
+    ax.set_xticklabels([]);  ax.set_yticklabels([])
 
     cbar = fig.colorbar(im, ax=ax, shrink=0.8)
-    cbar.set_label("Δ hires (scaled)")
+    cbar.set_label("% change" if norm=='flow' else "Δ hires (scaled)")
 
-    # -------- 5. mark subsidised targets -----------------------------------
+    # ---- 5. mark subsidised occupations -----------------------------------
     if green_idx is not None:
         for g in green_idx:
-            # column (destination)
-            ax.add_patch(patches.Rectangle((g-0.5, -0.5),
-                                           1, n, fill=False,
-                                           edgecolor='black', linewidth=1.5))
-            # row (origin)
-            ax.add_patch(patches.Rectangle((-0.5, g-0.5),
-                                           n, 1, fill=False,
-                                           edgecolor='black', linewidth=1.5))
+            ax.add_patch(patches.Rectangle((g-0.5, -0.5), 1, n,
+                                           fill=False, edgecolor='black', lw=1.5))
+            ax.add_patch(patches.Rectangle((-0.5, g-0.5), n, 1,
+                                           fill=False, edgecolor='black', lw=1.5))
 
     plt.tight_layout()
     return fig, delta
