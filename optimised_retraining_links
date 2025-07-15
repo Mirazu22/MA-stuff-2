@@ -1,0 +1,208 @@
+# retraining_optimiser.py
+# ------------------------------------------------------------
+# Build k new (or strengthened) outgoing links from a single
+# hard-hit occupation so as to minimise its cumulative
+# unemployment across a full automation-shock simulation.
+
+from __future__ import annotations
+from typing import Callable, Dict, Tuple, List
+import numpy as np
+import pandas as pd
+import random
+
+
+def tweak_row(
+    A: np.ndarray,
+    i: int,
+    j: int,
+    edge_mode: str,
+    i_omn: float,
+) -> np.ndarray:
+    """
+    Return a *copy* of A with row i modified:
+    • "add"     – set w_ij = max(w_ij, i_omn)
+    • "double"  – w_ij ← min(2 * w_ij, 1)
+    Afterwards renormalises row i (row-stochastic convention).
+    """
+    A_new = A.copy()
+    if edge_mode == "add":
+        A_new[i, j] = max(A_new[i, j], i_omn)
+    elif edge_mode == "double":
+        A_new[i, j] = min(2 * A_new[i, j], 1.0)
+    else:
+        raise ValueError("edge_mode must be 'add' or 'double'")
+
+    A_new[i, :] /= A_new[i, :].sum()
+    return A_new
+
+
+def compute_delta_V_peak(
+    V: np.ndarray,
+    E: np.ndarray,
+    t_shock: int,
+) -> np.ndarray:
+    """ΔV_peak for every occupation."""
+    V_rate = V / (V + E)
+    baseline = V_rate[t_shock - 1, :]          # row vector
+    return (V_rate[t_shock:, :] - baseline).max(axis=0)    # 1-D array
+
+
+def optimised_retraining_links(
+    A_omn_base: np.ndarray,
+    U_base: np.ndarray,
+    V_base: np.ndarray,
+    E_base: np.ndarray,
+    source_id: int,
+    run_model_fn: Callable[..., Tuple[np.ndarray, ...]],
+    model_kwargs: Dict,
+    t_shock: int,
+    k_links: int,
+    edge_mode: str = "add",          # "add" | "double"
+    scheme: str = "targeted",        # "targeted" | "random"
+    i_js_factor: float = 0.5,        # ι_js = factor × mean(weight)
+    patience: int = 10,              # stop after this many worse trials
+    seed: int | None = None,
+) -> Tuple[np.ndarray, pd.DataFrame]:
+    """
+    Parameters
+    ----------
+    A_omn_base : row-stochastic mobility matrix (n × n)
+    U_base, V_base, E_base : baseline run outputs used only for ΔV_peak
+    source_id : hard-hit occupation index
+    run_model_fn : callable(**model_kwargs, A=<matrix>) -> (U,E,V,...)
+    model_kwargs : dict with δ_u, γ_u, employment_0, ... passed through
+    t_shock : time index where the automation shock starts
+    k_links : number of new / boosted edges to create
+    edge_mode : 'add' sets w_ij = ι_omn ; 'double' multiplies by 2
+    scheme : 'targeted' (greedy) or 'random'
+    i_js_factor : ι_js = i_js_factor × mean(weight)
+    patience : early-stopping counter for greedy search
+    seed : RNG seed for reproducibility (random scheme)
+
+    Returns
+    -------
+    A_final : np.ndarray   (row-stochastic)
+    link_log : pd.DataFrame  [step, target_id, old_w, new_w, ΔV_peak, mode]
+    """
+
+    rng = random.Random(seed)
+
+    n_occ = A_omn_base.shape[0]
+    A_current = A_omn_base.copy()
+
+    # thresholds
+    i_js = i_js_factor * A_omn_base[A_omn_base > 0].mean()
+    i_omn = A_omn_base[A_omn_base > 0].mean()
+
+    # ΔV_peak for ranking
+    delta_V = compute_delta_V_peak(V_base, E_base, t_shock)
+
+    # viable neighbours: existing edges ≥ ι_js (Job-Space viability)
+    viable = np.where(A_omn_base[source_id, :] >= i_js)[0]
+    viable = viable[viable != source_id]          # exclude self
+
+    if len(viable) == 0:
+        raise RuntimeError("No viable neighbours satisfy the ι_js threshold")
+
+    # sort by descending ΔV_peak (people most needed first)
+    viable_sorted = viable[np.argsort(-delta_V[viable])]
+
+    if scheme == "random":
+        rng.shuffle(viable_sorted)
+
+    # bookkeeping
+    log_rows: List[Dict] = []
+    selected: set[int] = set()
+
+    for step in range(k_links):
+        if scheme == "random":
+            # pick the next not-yet-selected target
+            for tgt in viable_sorted:
+                if tgt not in selected:
+                    best_tgt = tgt
+                    break
+            else:
+                break  # ran out of candidates
+            best_metric = None  # not used
+        else:  # targeted greedy
+            best_metric = np.inf
+            best_tgt = None
+            worse_streak = 0
+
+            for tgt in viable_sorted:
+                if tgt in selected:
+                    continue
+
+                A_trial = tweak_row(A_current, source_id, tgt, edge_mode, i_omn)
+                U_trial = run_model_fn(A=A_trial, **model_kwargs)[0]  # returns U
+                metric = U_trial[:, source_id].sum()   # cumulative unemployment
+
+                if metric < best_metric:
+                    best_metric = metric
+                    best_tgt = tgt
+                    worse_streak = 0
+                else:
+                    worse_streak += 1
+                    if worse_streak >= patience:
+                        break   # early exit
+
+            if best_tgt is None:
+                break  # no improvement found
+
+        # apply the chosen target permanently
+        old_w = A_current[source_id, best_tgt]
+        A_current = tweak_row(A_current, source_id, best_tgt, edge_mode, i_omn)
+        new_w = A_current[source_id, best_tgt]
+
+        log_rows.append({
+            "step"        : step + 1,
+            "target_id"   : best_tgt,
+            "old_w"       : old_w,
+            "new_w"       : new_w,
+            "ΔV_peak"     : delta_V[best_tgt],
+            "mode"        : edge_mode,
+            "scheme"      : scheme,
+        })
+        selected.add(best_tgt)
+
+    link_log = pd.DataFrame(log_rows)
+    return A_current, link_log
+import labornet as lbn
+from retraining_optimiser import optimised_retraining_links
+
+# 1) Run the *baseline* model once to get U_base, V_base, E_base
+U_base, V_base, E_base, *_ = lbn.run_numerical_solution(..., A_omn_hetero, τ)
+
+# 2) Optimise k new edges for a chosen hard-hit occupation
+A_new, log_df = optimised_retraining_links(
+    A_omn_base = A_omn_hetero,
+    U_base = U_base,
+    V_base = V_base,
+    E_base = E_base,
+    source_id = 123,            # <-- your occupation id
+    run_model_fn = lbn.run_numerical_solution,
+    model_kwargs = dict(
+        fire_and_hire_fn = lbn.fire_and_hire_workers,  # or via functools.partial
+        t_simulation     = 600,
+        δ_u=δ_u, δ_v=δ_v, γ_u=γ_u, γ_v=γ_v,
+        employment_0=employment_0,
+        unemployment_0=unemployment_0,
+        vacancies_0=vacancies_0,
+        target_demand_fn=lbn.target_demand_automation,
+        D_0=D_0, D_f=D_f,
+        t_shock=t_shock, k=k, sigmoid_half_life=sigmoid_hl,
+        matching_prob_fn=lbn.matching_probability,
+        τ=τ
+    ),
+    t_shock = t_shock,
+    k_links = 10,
+    edge_mode = "add",          # or "double"
+    scheme = "targeted",        # or "random"
+    seed = 42
+)
+
+# 3) Run your main policy simulation with A_new
+U_policy, V_policy, E_policy, *_ = lbn.run_numerical_solution(..., A_new, τ)
+
+# 4) Inspect link_log
+print(log_df)
