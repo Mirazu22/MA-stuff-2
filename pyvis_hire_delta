@@ -1,0 +1,97 @@
+# -------------------------------------------------------------
+# Δ-Flow network visualiser  (PyVis version)
+# -------------------------------------------------------------
+import numpy as np
+from pyvis.network import Network
+
+def delta_flow_network_pyvis(F_base, F_treat,
+                             employment,
+                             labels=None,
+                             t_window=None,
+                             threshold=1e-4,
+                             pos_color="#2ca02c",
+                             neg_color="#d62728",
+                             notebook=False,
+                             html_out="delta_flow_network.html"):
+    """
+    Parameters
+    ----------
+    F_base, F_treat : ndarray (T, n, n)
+        Flow tensors from baseline and treatment runs (hires j←i).
+    employment      : ndarray (n,)
+        Employment level of each occupation (used for scaling & node size).
+    labels          : list[str] | None
+        Length n.  Labels for nodes; if None uses str(i).
+    t_window        : (start, end) | None
+        Slice of time steps to aggregate over; None = full horizon.
+    threshold       : float
+        Minimum |scaled ΔF| to keep an edge (avoids clutter).
+    pos_color, neg_color : str
+        Edge colours for positive / negative Δ hires.
+    notebook        : bool
+        If True, sets PyVis for Jupyter notebook display.
+    html_out        : str
+        File name for the saved interactive HTML.
+    """
+
+    if labels is None:
+        labels = list(map(str, range(F_base.shape[1])))
+
+    # 0. Drop self-loops
+    diag = np.arange(F_base.shape[1])
+    F_base = F_base.copy();  F_base[:, diag, diag] = 0.0
+    F_treat = F_treat.copy(); F_treat[:, diag, diag] = 0.0
+
+    # 1. Time slice
+    sl = slice(*t_window) if t_window else slice(None)
+    ΔF = F_treat[sl] - F_base[sl]              # shape (T, n, n)
+
+    # 2. Aggregate
+    ΔF_agg = ΔF.sum(axis=0)                    # shape (n, n)
+
+    # 3. Scale by origin employment (per-worker effect)
+    emp_safe = np.where(employment == 0, 1, employment)   # avoid /0
+    ΔF_scaled = ΔF_agg / emp_safe[:, None]
+
+    # 4. Build PyVis graph
+    n = ΔF_scaled.shape[0]
+    net = Network(height="700px", width="95%", directed=True, notebook=notebook)
+    net.force_atlas_2based(gravity=-30, central_gravity=0.005,
+                           spring_length=100, spring_strength=0.08,
+                           damping=0.4)
+
+    # add nodes sized by employment
+    max_emp = employment.max()
+    for i in range(n):
+        size = 10 + 40 * employment[i] / max_emp   # radius 10-50
+        net.add_node(i, label=labels[i], size=size, title=f"emp={employment[i]:,.0f}")
+
+    # add edges
+    kept = 0
+    for i in range(n):
+        for j in range(n):
+            w = ΔF_scaled[i, j]
+            if abs(w) >= threshold:
+                kept += 1
+                colour = pos_color if w > 0 else neg_color
+                width = 1 + 10 * abs(w)            # visual thickness
+                net.add_edge(i, j, value=abs(w), color=colour, width=width,
+                             title=f"Δ hires per worker = {w:+.4f}")
+
+    print(f"Δ-Flow network: kept {kept} edges | threshold = {threshold}")
+
+    # 5. Save / show
+    net.show(html_out)          # writes file & opens browser (unless in nb)
+    return net, ΔF_scaled
+
+# F_base, F_treat : (T, n, n) arrays already in memory
+# employment_0    : (n,) vector from the **baseline** run (t = 0)
+labels = list(df_labs["label"])        # or however you store names
+
+net, dF_scaled = delta_flow_network_pyvis(
+        F_base, F_treat,
+        employment_0,
+        labels=labels,
+        t_window=None,        # or (start, end)
+        threshold=0.0002,     # tune for clarity
+        html_out="delta_flow_network.html")
