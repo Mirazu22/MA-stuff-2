@@ -1,109 +1,124 @@
 import numpy as np
 import plotly.graph_objects as go
 
-def green_worker_origin_sankey_plotly(green_idx, labels,
-                                      F_base, F_pol,
-                                      E_base, E_pol,
-                                      U_base, U_pol,
-                                      top_k=10,
-                                      t_window=None,
-                                      scale_other=0.35):
+def green_worker_origin_sankey_plotly(
+        green_idx, labels,
+        F_base, F_pol,
+        E_base, E_pol,
+        U_base, U_pol,
+        top_k=10,
+        t_window=None,
+        scale_other=0.35):
     """
-    Sankey: cross-occupation inflow into subsidised jobs.
-      · self-loops removed
-      · origins that are subsidised themselves removed
-      · top_k donors shown individually
-      · all remaining donors collapsed into one 'Other donors' node,
-        scaled by `scale_other` so it doesn't dominate visually
-      · baseline (grey) + extra (green) stripes inside each ribbon
-      · flow numbers visible on ribbons via link.label
+    Interactive Sankey (Plotly) – cross-occupation inflow into subsidised jobs.
+      • self-loops removed
+      • origins that are subsidised themselves removed
+      • top_k donors shown individually
+      • ‘All other donors’ collapsed into one node, width scaled by scale_other
+      • baseline (grey) + extra (green) stripes inside each ribbon
+      • flow numbers printed on ribbons (scaled + true in brackets)
     """
 
-    # 0. -------- remove self-loops -----------------------------------------
+    # ---- 0  remove self-loops ---------------------------------------------
     diag = np.arange(F_base.shape[1])
     F_base = F_base.copy();  F_base[:, diag, diag] = 0.0
     F_pol  = F_pol.copy();   F_pol[:,  diag, diag] = 0.0
 
-    # 1. -------- aggregate inflow over time window -------------------------
+    # ---- 1  aggregate over time window ------------------------------------
     sl = slice(*t_window) if t_window else slice(None)
     base_in  = F_base[sl, :, green_idx].sum(axis=(0, 2))
     pol_in   = F_pol[sl, :, green_idx].sum(axis=(0, 2))
     extra_in = np.maximum(pol_in - base_in, 0.0)
 
-    # 2. -------- donor filtering -------------------------------------------
+    # ---- 2  donor filtering -----------------------------------------------
     is_green = np.zeros(extra_in.size, dtype=bool)
     is_green[green_idx] = True
     donor_mask_full = (~is_green) & (extra_in > 0)
 
-    # split into top-k and 'other'
     donor_candidates = np.where(donor_mask_full)[0]
     top_sorted_idx   = donor_candidates[np.argsort(extra_in[donor_candidates])[::-1]]
     donors = top_sorted_idx[:top_k]
-    other_mask = donor_mask_full.copy()
-    other_mask[donors] = False
+    other_mask = donor_mask_full.copy();  other_mask[donors] = False
 
-    # nothing to show?
     if donors.size == 0 and not other_mask.any():
         raise ValueError("No positive cross-occupation inflow detected.")
 
     base_flows  = base_in[donors]
     extra_flows = extra_in[donors]
 
-    # ----- aggregated 'other' flows ----------------------------------------
+    # -- aggregated 'other' flows -------------------------------------------
     base_other  = base_in[other_mask].sum()
     extra_other = extra_in[other_mask].sum()
     has_other   = (base_other + extra_other) > 0
 
-    # 3. -------- build nodes -----------------------------------------------
+    # ---- 3  nodes ----------------------------------------------------------
     node_labels = [labels[d] for d in donors]
     node_colors = ["#dddddd"] * len(donors)
 
     if has_other:
         other_id = len(node_labels)
-        node_labels.append("All other donors")
-        node_colors.append("#bbbbbb")          # slightly darker grey
+        txt_tot  = f"{base_other+extra_other:,.0f}"
+        node_labels.append(f"All other donors\n(total {txt_tot}, "
+                           f"shown ×{scale_other})")
+        node_colors.append("#bbbbbb")
 
     sink_id = len(node_labels)
     node_labels.append("Green jobs (total)")
-    node_colors.append("#b0e0b0")             # pale green
+    node_colors.append("#b0e0b0")
 
-    # 4. -------- build links -----------------------------------------------
+    # ---- 4  links ----------------------------------------------------------
     src, tgt, val, col, lbl = [], [], [], [], []
 
     # individual donors
     for idx, (b, e) in enumerate(zip(base_flows, extra_flows)):
         if b > 0:
             src += [idx];  tgt += [sink_id];  val += [b]
-            col += ["#888888"];  lbl += [f"{b:,.0f} (baseline)"]
+            col += ["#888888"]
+            lbl += [f"{b:,.0f}"]
         if e > 0:
             src += [idx];  tgt += [sink_id];  val += [e]
-            col += ["#2ca02c"];  lbl += [f"{e:,.0f} (extra)"]
+            col += ["#2ca02c"]
+            lbl += [f"{e:,.0f} (+)"]
 
-    # aggregated 'other'
+    # other donors (scaled)
     if has_other:
         scaled_b = base_other  * scale_other
         scaled_e = extra_other * scale_other
         if scaled_b > 0:
             src += [other_id];  tgt += [sink_id];  val += [scaled_b]
-            col += ["#888888"];  lbl += [f"{base_other:,.0f} (baseline, scaled)"]
+            col += ["#888888"]
+            lbl += [f"{scaled_b:,.0f} "
+                    f"(orig {base_other:,.0f})"]
         if scaled_e > 0:
             src += [other_id];  tgt += [sink_id];  val += [scaled_e]
-            col += ["#2ca02c"];  lbl += [f"{extra_other:,.0f} (extra, scaled)"]
+            col += ["#2ca02c"]
+            lbl += [f"{scaled_e:,.0f} (+) "
+                    f"(orig {extra_other:,.0f})"]
 
-    link = dict(source=src, target=tgt, value=val,
-                color=col, label=lbl,
-                hovertemplate="%{label}<extra></extra>")
+    link = dict(source=src,
+                target=tgt,
+                value=val,
+                color=col,
+                label=lbl,
+                font=dict(size=14, color="black"),
+                hovertemplate="%{label}<extra></extra>",
+                textangle=0)
 
-    node = dict(label=node_labels, color=node_colors, pad=15, thickness=15)
+    node = dict(label=node_labels,
+                color=node_colors,
+                pad=15,
+                thickness=15,
+                font=dict(size=14))
 
     fig = go.Figure(go.Sankey(node=node, link=link))
     fig.update_layout(title="Cross-occupation inflow into subsidised green jobs",
-                      font_size=12)
+                      font_size=14)
 
-    # 5. -------- console stats ---------------------------------------------
+    # ---- 5  console stats --------------------------------------------------
     print(f"\nTop-{len(donors)} donors (cross-occupation only)")
     print("{:<35s} {:>11s} {:>11s} {:>11s}".format(
           "Occupation", "base→green", "Δ hires", "Δ emp"))
+
     donor_table = []
     for d, b, e in zip(donors, base_flows, extra_flows):
         emp_delta = E_pol[-1, d] - E_base[-1, d]
@@ -122,17 +137,7 @@ def green_worker_origin_sankey_plotly(green_idx, labels,
                                 u_rate_delta=float(ur_delta)))
 
     if has_other:
-        print(f"\n'Other donors' aggregate: baseline→green = {base_other:,.0f}, "
-              f"extra hires = {extra_other:,.0f}")
+        print(f"\n'Other donors' aggregate (true numbers): "
+              f"baseline→green = {base_other:,.0f}, extra hires = {extra_other:,.0f}")
 
     return fig, donor_table
-fig, donors = green_worker_origin_sankey_plotly(
-                 green_idx, labels,
-                 F_b, F_p,
-                 E_b, E_p, U_b, U_p,
-                 top_k=15,
-                 scale_other=0.35)
-
-fig.show(renderer="browser")            # interactive view
-fig.write_html("origin_sankey.html")    # shareable HTML
-fig.write_image("origin_sankey.png")    # static (needs kaleido)
