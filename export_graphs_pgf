@@ -1,0 +1,111 @@
+# deps: seaborn, matplotlib
+import seaborn as sns
+import matplotlib as mpl
+
+# Full-width \linewidth you measured in Nova Thesis (memoir, A4)
+DEFAULT_TEXTWIDTH_IN = 6.29707  # 455.0 pt / 72.27 pt per inch
+
+def set_econ_paper_style(font_scale=1.0,
+                         width=DEFAULT_TEXTWIDTH_IN,  # default = your full-width
+                         height_ratio=0.62,           # height = width * height_ratio
+                         use_pgf=True):
+    """
+    Economist-style, journal-ready Seaborn/Matplotlib theme that
+    produces PGF figures for Overleaf/pdfLaTeX WITHOUT needing LaTeX on the server.
+
+    Defaults:
+      - width = 6.29707 in  (your measured \\linewidth inside figure)
+      - height = width * 0.62
+
+    Colors:
+      - No custom palette/cycler; Seaborn's defaults are used.
+
+    Notes:
+      - Call BEFORE importing matplotlib.pyplot as plt.
+      - For subfigures, pass a smaller width, e.g., width=0.48*DEFAULT_TEXTWIDTH_IN.
+    """
+    # ---- Backend (must be set before importing pyplot) ----
+    if use_pgf:
+        try:
+            mpl.use("pgf")
+        except Exception:
+            # If pyplot was already imported, backend can't be changed now.
+            pass
+
+    # ---- Compute figure size ----
+    if isinstance(width, tuple):
+        figsize = width  # exact (w, h) inches
+    else:
+        w = float(width)
+        figsize = (w, max(1.5, w * float(height_ratio)))  # guard tiny heights
+
+    rc = {
+        # --- typography (defer real fonts to LaTeX at compile time) ---
+        "font.family": "serif",
+        "font.serif": [],                 # empty => inherit document serif (e.g., NewTX)
+        "font.size": 7 * font_scale,
+        "axes.titlesize": 8 * font_scale,
+        "axes.labelsize": 7 * font_scale,
+        "axes.titleweight": "bold",
+
+        # --- layout & spines ---
+        "axes.edgecolor": "black",
+        "axes.linewidth": 0.8,
+        "axes.axisbelow": True,
+        "axes.grid": True,
+        "grid.color": ".8",
+        "grid.linestyle": "--",
+        "grid.linewidth": 0.5,
+
+        # --- ticks ---
+        "xtick.direction": "out",
+        "ytick.direction": "out",
+        "xtick.major.size": 3,
+        "ytick.major.size": 3,
+        "xtick.major.width": 0.8,
+        "ytick.major.width": 0.8,
+
+        # --- lines & markers ---
+        "lines.linewidth": 1.0,
+        "lines.markersize": 4,
+
+        # --- legend ---
+        "legend.fontsize": 6 * font_scale,
+        "legend.frameon": False,
+
+        # --- figure & saving ---
+        "figure.figsize": figsize,            # <- full width by default (6.29707 in)
+        "figure.constrained_layout.use": True,
+        "savefig.dpi": 300,                   # ignored for PGF/PDF vector; useful for PNG
+
+        # --- PGF/LaTeX-related for server-side generation ---
+        "pgf.texsystem": "pdflatex",          # match Overleaf engine
+        "pgf.rcfonts": False,                 # let the LaTeX document control fonts
+        "text.usetex": False,                 # no LaTeX on the server
+
+        # --- keep text as text for other formats too ---
+        "pdf.fonttype": 42,
+        "ps.fonttype": 42,
+        "svg.fonttype": "none",
+    }
+
+    # Apply Seaborn theme (default colors) + rc
+    sns.set_theme(context="paper", style="ticks", rc=rc)
+    return rc
+
+
+
+# Call BEFORE importing pyplot
+from my_style_module import set_econ_paper_style, DEFAULT_TEXTWIDTH_IN
+set_econ_paper_style()  # uses your full-width 6.29707 in by default
+
+import matplotlib.pyplot as plt
+
+
+fig.savefig(
+    "figure.pgf",
+    format="pgf",          # write PGF code for LaTeX to typeset
+    dpi=300,               # ONLY affects rasterized artists (imshow, rasterized=True)
+    bbox_inches=None,      # let constrained_layout/tight_layout handle spacing
+)
+
