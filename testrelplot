@@ -1,0 +1,28 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+df = sns.load_dataset("tips")          # replace with your DataFrame
+x_col = "day"                         # categorical x
+y_col = "tip"
+hue_col = "total_bill"                # continuous hue
+
+# map categories to numeric positions
+cats = pd.Categorical(df[x_col])
+x_pos = cats.codes.astype(float)
+
+# add horizontal jitter so it looks like a strip
+rng = np.random.RandomState(42)
+x_jitter = x_pos + rng.uniform(-0.18, 0.18, size=len(df))
+
+fig, ax = plt.subplots(figsize=(8,4))
+sc = ax.scatter(x_jitter, df[y_col], c=df[hue_col], s=30, cmap="viridis", alpha=0.85)
+ax.set_xticks(np.arange(len(cats.categories)))
+ax.set_xticklabels(cats.categories)
+ax.set_xlabel(x_col)
+ax.set_ylabel(y_col)
+cbar = plt.colorbar(sc, ax=ax)
+cbar.set_label(hue_col)
+plt.tight_layout()
+plt.show()
