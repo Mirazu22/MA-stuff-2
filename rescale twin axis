@@ -1,0 +1,61 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+def align_zero_on_twins(ax_ref, ax_to_adjust):
+    """
+    Modify ax_to_adjust.yaxis limits so that y=0 is at the same physical height
+    (same axis fraction) as y=0 on ax_ref.
+    This keeps ax_to_adjust's data span when possible, but will expand the span if
+    needed to avoid clipping existing data.
+    """
+    # reference fraction (where 0 sits on ax_ref: 0 => bottom, 1 => top)
+    yref_min, yref_max = ax_ref.get_ylim()
+    # avoid division by zero
+    if yref_max == yref_min:
+        return
+    frac = (0.0 - yref_min) / (yref_max - yref_min)
+
+    # get current limits of axis we will change
+    ymin, ymax = ax_to_adjust.get_ylim()
+    span = ymax - ymin
+    if span == 0:
+        return
+
+    # compute minimum span required so that after shifting zero to 'frac' we still
+    # include the current ymin/ymax (avoid clipping existing plotted data)
+    # newmin = 0 - frac * span_new
+    # newmax = newmin + span_new = (1-frac)*span_new
+    # require newmin <= ymin and newmax >= ymax
+    min_needed_from_lower = (-ymin) / frac if frac > 0 else 0
+    min_needed_from_upper = ymax / (1 - frac) if (1 - frac) > 0 else 0
+    span_new = max(span, min_needed_from_lower, min_needed_from_upper)
+
+    new_min = 0.0 - frac * span_new
+    new_max = new_min + span_new
+    ax_to_adjust.set_ylim(new_min, new_max)
+
+
+# Example usage
+x = np.linspace(0, 10, 400)
+y1 = np.sin(x)                # left axis
+y2 = 10*(x - 5)               # right axis, very different scale
+
+fig, ax1 = plt.subplots(figsize=(7,4))
+ax2 = ax1.twinx()
+
+ax1.plot(x, y1, label='sin(x)')
+ax2.plot(x, y2, label='10*(x-5)')
+
+# IMPORTANT: call after plotting and after autoscaling (i.e. when final data exists)
+ax1.relim(); ax1.autoscale_view()
+ax2.relim(); ax2.autoscale_view()
+
+# align zeros
+align_zero_on_twins(ax1, ax2)
+
+ax1.axhline(0, color='gray', linewidth=0.6)
+ax2.axhline(0, color='gray', linewidth=0.6, linestyle='--')
+
+ax1.set_ylabel('left axis')
+ax2.set_ylabel('right axis')
+plt.show()
