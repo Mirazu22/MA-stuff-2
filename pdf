@@ -1,0 +1,75 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[ngerman,english]{babel}
+\usepackage{geometry}
+\usepackage{setspace}
+\usepackage{parskip}
+\usepackage{array}
+\usepackage{ragged2e}
+\geometry{margin=2.5cm}
+\setlength{\parskip}{6pt}
+
+\begin{document}
+\selectlanguage{ngerman}
+
+\begin{flushleft}
+\textbf{Zentrales Prüfungsamt}\\[8pt]
+{\LARGE\textbf{Selbstständigkeitserklärung}}
+\end{flushleft}
+
+\vspace{8pt}
+
+\begin{tabular}{@{}p{3.2cm}p{12cm}@{}}
+\textbf{Name:} & \hrulefill \\[8pt]
+\textbf{Vorname:} & \hrulefill \\[8pt]
+\textbf{geb.\ am:} & \hrulefill \\[8pt]
+\textbf{Matr.-Nr.:} & \hrulefill \\
+\end{tabular}
+
+\vspace{16pt}
+
+\textbf{Bitte beachten:}
+
+\begin{enumerate}
+\setlength{\itemsep}{0pt}
+\item Bitte binden Sie dieses Blatt am Ende Ihrer Arbeit ein.
+\end{enumerate}
+
+\vspace{8pt}
+
+\noindent\textbf{Selbstständigkeitserklärung*}
+
+\onehalfspacing
+\noindent Ich erkläre gegenüber der Technischen Universität Chemnitz, dass ich die vorliegende Arbeit
+selbstständig und ohne Benutzung anderer als der angegebenen Quellen und Hilfsmittel angefertigt habe.
+\\
+Die vorliegende Arbeit ist frei von Plagiaten. Alle Ausführungen, die wörtlich oder inhaltlich aus
+anderen Schriften entnommen sind, habe ich als solche kenntlich gemacht.
+\\
+Diese Arbeit wurde in gleicher oder ähnlicher Form noch nicht als Prüfungsleistung eingereicht und
+ist auch noch nicht veröffentlicht.
+
+\vspace{20pt}
+
+\noindent\begin{tabular}{@{}p{5cm}p{1cm}p{8cm}@{}}
+\textbf{Ort, Datum:} \hrulefill & & \textbf{Unterschrift:} \hrulefill \\
+\end{tabular}
+
+\vspace{18pt}
+\singlespacing
+
+\selectlanguage{english}
+\noindent\textit{* Statement of Authorship}
+
+\onehalfspacing
+\noindent I hereby certify to the Technische Universit\"{a}t Chemnitz that this thesis is all my own work
+and uses no external material other than that acknowledged in the text.
+\\
+This work contains no plagiarism and all sentences or passages directly quoted from other people's work or
+including content derived from such work have been specifically credited to the authors and sources.
+\\
+This paper has neither been submitted in the same or a similar form to any other examiner nor for the award of any
+other degree, nor has it previously been published.
+
+\end{document}
