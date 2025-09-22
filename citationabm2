@@ -1,0 +1,11 @@
+@article{MartinNeugart2009,
+  author  = {Martin, Christian W. and Neugart, Michael},
+  title   = {Shocks and Endogenous Institutions: An Agent-based Model of Labor Market Performance in Turbulent Times},
+  journaltitle = {Computational Economics},
+  volume  = {33},
+  number  = {1},
+  date    = {2009-02},
+  pages   = {31--46},
+  doi     = {10.1007/s10614-008-9149-z},
+  url     = {https://link.springer.com/article/10.1007/s10614-008-9149-z}
+}
