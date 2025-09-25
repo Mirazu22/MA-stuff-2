@@ -1,0 +1,21 @@
+unused_axes_idx = list(range(n_series, len(axes)))
+if unused_axes_idx:
+    legend_ax = axes[unused_axes_idx[0]]
+    # Hide axis frame/ticks
+    legend_ax.set_axis_off()
+
+    # Create proxy handles for legend
+    proxy_handles = [
+        Line2D([0], [0], color="black", lw=2),
+        Line2D([0], [0], color="red",   lw=2)
+    ]
+    legend_labels = ["arr (black)", "arr2 (red)"]
+
+    # Place legend centered in that empty subplot
+    legend_ax.legend(proxy_handles, legend_labels,
+                     loc="center", frameon=False, fontsize=12, ncol=1, title="Legend")
+else:
+    # No empty subplot available: put a single legend on the figure (top-right)
+    handles = [Line2D([0], [0], color="black", lw=2),
+               Line2D([0], [0], color="red",   lw=2)]
+    fig.legend(handles, ["arr (black)", "arr2 (red)"], loc="upper right")
