@@ -1,0 +1,91 @@
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+from matplotlib.patches import Ellipse
+from scipy.stats import chi2
+
+def confidence_ellipse(x, y, ax, n_std=1.96, **kwargs):
+    """
+    Draw a covariance confidence ellipse of *x* and *y*.
+    n_std = 1.96 -> ~95% CI
+    """
+    if len(x) < 2:
+        return  # not enough data
+
+    cov = np.cov(x, y)
+    mean_x, mean_y = np.mean(x), np.mean(y)
+
+    lambda_, v = np.linalg.eig(cov)
+    order = lambda_.argsort()[::-1]
+    lambda_ = lambda_[order]
+    v = v[:, order]
+
+    theta = np.degrees(np.arctan2(*v[:, 0][::-1]))
+
+    # Scale eigenvalues to confidence region
+    chi2_val = chi2.ppf(0.95, df=2)  # 95%
+    width, height = 2 * np.sqrt(lambda_ * chi2_val)
+
+    ellipse = Ellipse(
+        (mean_x, mean_y),
+        width, height,
+        angle=theta,
+        fill=False,
+        lw=2,
+        **kwargs
+    )
+    ax.add_patch(ellipse)
+
+
+# Main plot
+fig, ax = plt.subplots(figsize=(10, 7))
+
+# Base scatter (all points)
+sns.scatterplot(
+    data=metrics_unf_3,
+    x="SP_22",
+    y="average_neighbor_exposure",
+    hue="sector",
+    palette=color_palette,
+    s=10, alpha=0.25, linewidth=0,
+    legend=False,
+    ax=ax
+)
+
+# Sector means (big pops)
+means = metrics_unf_3.groupby("sector").mean().reset_index()
+
+sns.scatterplot(
+    data=means,
+    x="SP_22",
+    y="average_neighbor_exposure",
+    hue="sector",
+    palette=color_palette,
+    s=200, alpha=1, edgecolor="black",
+    linewidth=1.5, marker="o",
+    legend="brief",
+    ax=ax
+)
+
+# Confidence ellipses
+for sector, group in metrics_unf_3.groupby("sector"):
+    confidence_ellipse(
+        group["SP_22"],
+        group["average_neighbor_exposure"],
+        ax=ax,
+        edgecolor=color_palette[group["sector"].iloc[0]]
+    )
+
+# Optional global regression line
+sns.regplot(
+    x="SP_22", y="average_neighbor_exposure",
+    data=metrics_unf_3,
+    scatter=False, line_kws={"color": "black", "lw": 2},
+    ax=ax
+)
+
+ax.set_title("Exposure vs. Skill Premium by Sector")
+ax.legend(title="Sector (Mean)")
+sns.despine()
+plt.tight_layout()
+plt.show()
