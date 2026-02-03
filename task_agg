@@ -1,0 +1,102 @@
+import numpy as np
+import pandas as pd
+from scipy import sparse
+
+# -------------------------------------------------------------------
+# INPUTS (rename these to match your actual column names)
+# -------------------------------------------------------------------
+# Long-format task data (Berufenet job × task)
+# Must contain at least: job_id, kldb5, kldb4, task_id
+df = df.copy()
+
+JOB_COL  = "job_id"     # Berufenet job identifier
+K5_COL   = "kldb_5"     # 5-digit KldB code
+K4_COL   = "kldb_4"     # 4-digit KldB code
+TASK_COL = "task_id"    # task identifier
+
+# Employment weights mapping 5-digit -> 4-digit
+# Must contain: kldb_5, kldb_4, weight
+wdf = wdf.copy()
+
+W_K5_COL = "kldb_5"
+W_K4_COL = "kldb_4"
+W_COL    = "weight"     # employment share or headcount weight
+
+# -------------------------------------------------------------------
+# 0) Keep only what we need + deduplicate (job, task) just in case
+# -------------------------------------------------------------------
+df0 = (
+    df[[JOB_COL, K5_COL, K4_COL, TASK_COL]]
+    .dropna(subset=[JOB_COL, K5_COL, K4_COL, TASK_COL])
+    .drop_duplicates([JOB_COL, TASK_COL])
+)
+
+# -------------------------------------------------------------------
+# 1) OPTIONAL STEP (recommended): normalize within each Berufenet job
+#    Each job contributes total mass 1 across its tasks:
+#      x_hat_{jt} = 1 / (#tasks in job j) for each task in that job
+# -------------------------------------------------------------------
+tasks_per_job = df0.groupby(JOB_COL)[TASK_COL].transform("size").astype(float)
+df0["job_task_w"] = 1.0 / tasks_per_job
+
+# -------------------------------------------------------------------
+# 2) Aggregate to 5-digit: sum normalized job contributions by (kldb_5, task)
+#      c_{k,t} = Σ_j x_hat_{jt}
+# -------------------------------------------------------------------
+k5_task = (
+    df0.groupby([K5_COL, TASK_COL], as_index=False)["job_task_w"]
+       .sum()
+       .rename(columns={"job_task_w": "c_k5t"})
+)
+
+# -------------------------------------------------------------------
+# 3) Normalize within 5-digit to get a task-share vector p_{k,t}
+#      p_{k,t} = c_{k,t} / Σ_t c_{k,t}
+# -------------------------------------------------------------------
+k5_task["p_k5t"] = k5_task["c_k5t"] / k5_task.groupby(K5_COL)["c_k5t"].transform("sum")
+
+# -------------------------------------------------------------------
+# 4) Apply 5->4 employment weights to get 4-digit task vector v_{g,t}
+#      v_{g,t} = Σ_k w_{k->g} * p_{k,t}
+# -------------------------------------------------------------------
+# Clean weights (if they are shares, they ideally sum to 1 within each kldb_4)
+wdf0 = wdf[[W_K5_COL, W_K4_COL, W_COL]].dropna().copy()
+
+# (Optional sanity check) do weights sum to ~1 within each kldb_4?
+# weight_sums = wdf0.groupby(W_K4_COL)[W_COL].sum().sort_values()
+# print(weight_sums.describe())
+
+k4_task = (
+    k5_task.merge(wdf0, left_on=K5_COL, right_on=W_K5_COL, how="inner")
+           .assign(v=lambda x: x["p_k5t"] * x[W_COL])
+           .groupby([W_K4_COL, TASK_COL], as_index=False)["v"].sum()
+           .rename(columns={W_K4_COL: K4_COL, "v": "v_k4t"})
+)
+
+# -------------------------------------------------------------------
+# 5) Build sparse Occupation(4-digit) × Task matrix
+#    Rows: kldb_4, Cols: task_id, Values: v_k4t
+# -------------------------------------------------------------------
+# Factorize to integer indices
+row_codes, row_index = pd.factorize(k4_task[K4_COL], sort=True)
+col_codes, col_index = pd.factorize(k4_task[TASK_COL], sort=True)
+
+data = k4_task["v_k4t"].to_numpy(dtype=float)
+
+X_k4_task = sparse.csr_matrix(
+    (data, (row_codes, col_codes)),
+    shape=(len(row_index), len(col_index))
+)
+
+# -------------------------------------------------------------------
+# OUTPUTS you will use later
+# -------------------------------------------------------------------
+# X_k4_task : csr_matrix (n_kldb4 × n_tasks)
+# row_index : Index of kldb_4 codes in row order
+# col_index : Index of task_ids in column order
+print("Sparse matrix shape:", X_k4_task.shape)
+print("Nonzeros:", X_k4_task.nnz)
+
+# If you want to keep the mapping tables for later merges:
+kldb4_lookup = pd.DataFrame({K4_COL: row_index, "row": np.arange(len(row_index))})
+task_lookup  = pd.DataFrame({TASK_COL: col_index, "col": np.arange(len(col_index))})
