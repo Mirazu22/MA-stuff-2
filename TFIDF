@@ -1,83 +1,47 @@
 import numpy as np
 from scipy import sparse
-from sklearn.preprocessing import normalize
 
-def tfidf_cosine_similarity(X_csr: sparse.csr_matrix, smooth_idf: bool = True) -> sparse.csr_matrix:
+def tfidf_cosine_similarity_scipy(X_csr: sparse.csr_matrix, smooth_idf: bool = True) -> sparse.csr_matrix:
     """
-    TF-IDF + cosine similarity on an occupation x task matrix X.
-    X can be weighted (recommended).
-    Returns a sparse similarity matrix S = Z_norm @ Z_norm.T
-    """
-    X = X_csr.tocsr()
+    TF–IDF + cosine similarity using only NumPy + SciPy.
+    X is occupation x task (can be weighted).
 
+    Steps:
+      df_w = #occ where task w present
+      idf_w = log((N+1)/(df_w+1)) + 1   (if smooth_idf) else log(N/df_w)
+      Z = X * idf  (column scaling)
+      Z_norm = row-wise L2 normalization
+      S = Z_norm @ Z_norm^T
+
+    Returns sparse CSR matrix S.
+    """
+    X = X_csr.tocsr().astype(float)
     n_occ = X.shape[0]
 
-    # df_w based on presence (not magnitude)
+    # document frequency based on presence (not magnitude)
     A = (X > 0).astype(np.int8)
     df = np.asarray(A.sum(axis=0)).ravel().astype(float)
 
     if smooth_idf:
-        # common stable variant: log((N+1)/(df+1)) + 1
         idf = np.log((n_occ + 1.0) / (df + 1.0)) + 1.0
     else:
-        # closer to plain log(N/df), but less stable
         df[df == 0] = np.nan
         idf = np.log(n_occ / df)
 
-    # TF-IDF weighting by column scaling
+    # TF-IDF via column scaling
     Z = X.multiply(idf)
 
-    # L2 row-normalize so dot product = cosine similarity
-    Z_norm = normalize(Z, norm="l2", axis=1, copy=True)
+    # Row-wise L2 normalization: Z_norm = D^{-1} Z, where D_i = ||Z_i||_2
+    row_sq_sum = np.asarray(Z.multiply(Z).sum(axis=1)).ravel()
+    row_norm = np.sqrt(row_sq_sum)
+    row_norm[row_norm == 0.0] = 1.0  # avoid division by zero for empty rows
+    inv_row_norm = 1.0 / row_norm
 
+    # Left-multiply by diagonal matrix of inv norms (efficient)
+    Z_norm = sparse.diags(inv_row_norm) @ Z
+
+    # Cosine similarity
     S = Z_norm @ Z_norm.T
     S.setdiag(0.0)
     S.eliminate_zeros()
     return S
-
-# Example usage:
-# S_tfidf = tfidf_cosine_similarity(X_k4_task)
-# print(S_tfidf.shape, S_tfidf.nnz)
-
-import numpy as np
-import pandas as pd
-from scipy import sparse
-
-def topk_edge_list(S: sparse.csr_matrix, k: int = 20, min_sim: float = 0.0) -> pd.DataFrame:
-    """
-    From a sparse similarity matrix S (csr), keep top-k edges per row.
-    Returns an edge list with columns: i, j, sim
-    """
-    S = S.tocsr()
-    edges = []
-
-    for i in range(S.shape[0]):
-        start, end = S.indptr[i], S.indptr[i+1]
-        cols = S.indices[start:end]
-        vals = S.data[start:end]
-
-        if len(vals) == 0:
-            continue
-
-        # filter by minimum similarity if desired
-        if min_sim > 0:
-            mask = vals >= min_sim
-            cols, vals = cols[mask], vals[mask]
-
-        if len(vals) == 0:
-            continue
-
-        # top-k by value
-        if len(vals) > k:
-            idx = np.argpartition(vals, -k)[-k:]
-            cols, vals = cols[idx], vals[idx]
-
-        for j, v in zip(cols, vals):
-            if i != j:
-                edges.append((i, j, float(v)))
-
-    return pd.DataFrame(edges, columns=["i", "j", "sim"])
-
-# Example:
-# edges_gamma = topk_edge_list(gamma, k=20, min_sim=0.0)
-# edges_tfidf = topk_edge_list(S_tfidf, k=20, min_sim=0.0)
