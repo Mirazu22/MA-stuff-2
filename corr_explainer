@@ -1,0 +1,95 @@
+import numpy as np
+import pandas as pd
+from scipy import sparse, stats
+
+# ------------------------------------------------------------
+# INPUTS you already have:
+#   flows  : (n_occ x n_occ) matrix (numpy array or scipy sparse) of empirical flows
+#   S_tfidf: (n_occ x n_occ) similarity matrix (scipy sparse recommended)
+#   S_gamma: (n_occ x n_occ) similarity matrix (scipy sparse recommended)
+# ------------------------------------------------------------
+
+def _to_upper_vector(M, k=1):
+    """Return upper-triangular (k=1 excludes diagonal) as 1D float array."""
+    if sparse.issparse(M):
+        M = M.tocsr()
+        A = M.toarray()  # OK if n_occ not huge; see note below
+    else:
+        A = np.asarray(M)
+    iu = np.triu_indices(A.shape[0], k=k)
+    return A[iu].astype(float)
+
+# ---- 0) Vectorize upper triangles (off-diagonal) ----
+y = _to_upper_vector(flows, k=1)
+x1 = _to_upper_vector(S_tfidf, k=1)
+x2 = _to_upper_vector(S_gamma, k=1)
+
+# Drop NaNs/inf and (optionally) drop pairs with both similarities = 0 and flow = 0
+mask = np.isfinite(y) & np.isfinite(x1) & np.isfinite(x2)
+y, x1, x2 = y[mask], x1[mask], x2[mask]
+
+# ---- 1) Simple OLS regressions (with intercept) and residual checks ----
+def ols_residuals(y, x):
+    X = np.column_stack([np.ones_like(x), x])
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    resid = y - X @ beta
+    return beta, resid
+
+b_y_x1, r_y_x1 = ols_residuals(y, x1)   # y ~ x1
+b_x1_x2, r_x1_x2 = ols_residuals(x1, x2) # x1 ~ x2  (residual = x1⊥x2)
+b_x2_x1, r_x2_x1 = ols_residuals(x2, x1) # x2 ~ x1  (residual = x2⊥x1)
+
+pear_y_x1 = np.corrcoef(y, x1)[0,1]
+pear_y_x2 = np.corrcoef(y, x2)[0,1]
+pear_y_r1 = np.corrcoef(y, r_x1_x2)[0,1]  # does the "unique TFIDF part" correlate with flows?
+pear_y_r2 = np.corrcoef(y, r_x2_x1)[0,1]  # does the "unique gamma part" correlate with flows?
+
+# ---- 2) Spearman rank correlations ----
+spr_y_x1 = stats.spearmanr(y, x1).correlation
+spr_y_x2 = stats.spearmanr(y, x2).correlation
+
+# ---- 3) Quantile checks: correlation within similarity quantiles ----
+def corr_by_quantile(y, x, q=10):
+    # bin by x quantiles; duplicates='drop' handles repeated values
+    bins = pd.qcut(x, q=q, labels=False, duplicates="drop")
+    out = []
+    for b in np.sort(pd.unique(bins)):
+        idx = (bins == b)
+        if idx.sum() < 10:
+            continue
+        out.append({
+            "bin": int(b),
+            "n": int(idx.sum()),
+            "x_range": (float(np.min(x[idx])), float(np.max(x[idx]))),
+            "pearson": float(np.corrcoef(y[idx], x[idx])[0,1]) if np.std(x[idx]) > 0 and np.std(y[idx]) > 0 else np.nan,
+            "spearman": float(stats.spearmanr(y[idx], x[idx]).correlation),
+            "mean_flow": float(np.mean(y[idx])),
+            "mean_sim": float(np.mean(x[idx])),
+        })
+    return pd.DataFrame(out)
+
+q_tfidf = corr_by_quantile(y, x1, q=10)
+q_gamma = corr_by_quantile(y, x2, q=10)
+
+# ---- Print summary ----
+print("Pearson corr with flows:")
+print(f"  corr(y, TFIDF) = {pear_y_x1:.6f}")
+print(f"  corr(y, GAMMA) = {pear_y_x2:.6f}\n")
+
+print("Residual diagnostics (partialling-out the other similarity):")
+print("  TFIDF unique part = resid( TFIDF ~ GAMMA )")
+print(f"    corr(y, TFIDF_unique) = {pear_y_r1:.6f}")
+print("  GAMMA unique part = resid( GAMMA ~ TFIDF )")
+print(f"    corr(y, GAMMA_unique) = {pear_y_r2:.6f}\n")
+
+print("Spearman corr with flows:")
+print(f"  spearman(y, TFIDF) = {spr_y_x1:.6f}")
+print(f"  spearman(y, GAMMA) = {spr_y_x2:.6f}\n")
+
+print("Quantile-by-quantile correlations (TFIDF):")
+print(q_tfidf[["bin","n","pearson","spearman","mean_flow","mean_sim","x_range"]].to_string(index=False))
+print("\nQuantile-by-quantile correlations (GAMMA):")
+print(q_gamma[["bin","n","pearson","spearman","mean_flow","mean_sim","x_range"]].to_string(index=False))
+
+# NOTE: _to_upper_vector converts sparse matrices to dense arrays.
+# If n_occ is large (e.g., > 5k), say so and I’ll give you a sparse-safe vectorizer.
