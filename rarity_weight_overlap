@@ -1,0 +1,38 @@
+import numpy as np
+from scipy import sparse
+
+def rarity_weighted_min_overlap_similarity(X_csr: sparse.csr_matrix) -> sparse.csr_matrix:
+    """
+    Implements the similarity measure in your excerpt using a binarized A:
+      s_w = 1 / (#occ that have task w)
+      shared_rare_ij = Σ_w A_iw A_jw s_w
+      gamma_ij = min(shared_rare_ij / tasks_i, shared_rare_ij / tasks_j)
+              = shared_rare_ij / max(tasks_i, tasks_j)
+
+    Returns sparse CSR matrix gamma.
+    """
+    X = X_csr.tocsr()
+
+    # Binary presence matrix A
+    A = (X > 0).astype(np.int8).tocsr()
+
+    # df_w = number of occupations that contain task w
+    df = np.asarray(A.sum(axis=0)).ravel().astype(float)
+    df[df == 0] = np.nan
+    s = 1.0 / df  # scarcity weights
+
+    # shared_rare = (A * diag(s)) @ A^T
+    shared_rare = A.multiply(s) @ A.T   # sparse
+
+    # tasks_i = number of tasks in occupation i
+    tasks = np.asarray(A.sum(axis=1)).ravel().astype(float)
+
+    # Convert to COO to scale nonzeros by row/col denom
+    M = shared_rare.tocoo()
+    denom = np.maximum(tasks[M.row], tasks[M.col])
+    data = M.data / denom
+
+    gamma = sparse.coo_matrix((data, (M.row, M.col)), shape=A.shape).tocsr()
+    gamma.setdiag(0.0)
+    gamma.eliminate_zeros()
+    return gamma
